@@ -1,0 +1,69 @@
+name: sentiric
+
+x-common-settings: &common-settings
+  dns:
+    - ${DISCOVERY_SERVICE_IPV4_ADDRESS:-10.88.5.1}
+    - ${PRIMARY_DNS:-8.8.8.8}
+    - ${SECONDARY_DNS:-1.1.1.1}
+  dns_search:
+    - ${DISCOVERY_DNS_SEARCH_DOMAIN:-service.sentiric.cloud}
+  restart: always
+
+networks:
+  sentiric-net:
+    driver: bridge
+    name: sentiric-net
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-10.88.0.0/16}
+          gateway: ${NETWORK_GATEWAY:-10.88.0.1}
+
+# volumes:
+
+services:
+
+  b2bua-service:
+    <<: *common-settings
+
+    image: ghcr.io/sentiric/sentiric-b2bua-service:${TAG:-latest}
+
+    build:
+      context: ../sentiric-b2bua-service
+      dockerfile: Dockerfile
+
+    environment:
+      # --- Network
+      # IP: 10.88.30.8  =>  Port Bloğu: 1308X
+      - B2BUA_SERVICE_IPV4_ADDRESS=10.88.30.8
+      - B2BUA_SERVICE_HTTP_PORT=13080
+      - B2BUA_SERVICE_GRPC_PORT=13081
+      - B2BUA_SERVICE_METRICS_PORT=13082
+      - B2BUA_SERVICE_HOST=b2bua-service
+
+      # --- Security
+      - GRPC_TLS_CA_PATH=/sentiric-certificates/certs/ca.crt
+      - B2BUA_SERVICE_CERT_PATH=/sentiric-certificates/certs/b2bua-service-chain.crt
+      - B2BUA_SERVICE_KEY_PATH=/sentiric-certificates/certs/b2bua-service.key
+
+    volumes:
+      - "${CERTIFICATES_REPO_PATH:../sentiric-certificates}:/sentiric-certificates:ro"
+
+    networks:
+      sentiric-net:
+        ipv4_address: ${B2BUA_SERVICE_IPV4_ADDRESS:-10.88.30.8}
+
+    ports:
+      - "${B2BUA_SERVICE_HTTP_PORT:-13080}:${B2BUA_SERVICE_HTTP_PORT:-13080}"
+      - "${B2BUA_SERVICE_GRPC_PORT:-13081}:${B2BUA_SERVICE_GRPC_PORT:-13081}"
+      - "${B2BUA_SERVICE_METRICS_PORT:-13082}:${B2BUA_SERVICE_METRICS_PORT:-13082}"
+
+    healthcheck:
+      test: [ "CMD", "nc", "-z", "localhost", "${B2BUA_SERVICE_GRPC_PORT:-13081}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # depends_on:
+    #   # Altyapı Servisleri -> 'healthy' olmalı       
+    #   rabbitmq: { condition: service_healthy }    
+    #   # Uygulama Servisleri -> Sadece 'started' olmaları yeterli    
+    #   media-service: { condition: service_started }     
