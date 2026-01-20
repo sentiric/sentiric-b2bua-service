@@ -5,39 +5,50 @@ use sentiric_contracts::sentiric::sip::v1::{
     TransferCallRequest, TransferCallResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{info, instrument};
+use tracing::{info, instrument, error};
+use std::sync::Arc;
+use crate::sip::engine::B2BuaEngine;
 
-pub struct MyB2BuaService {}
+pub struct MyB2BuaService {
+    engine: Arc<B2BuaEngine>,
+}
+
+impl MyB2BuaService {
+    pub fn new(engine: Arc<B2BuaEngine>) -> Self {
+        Self { engine }
+    }
+}
 
 #[tonic::async_trait]
 impl B2buaService for MyB2BuaService {
     
-    #[instrument(skip_all, fields(from = %request.get_ref().from_uri, to = %request.get_ref().to_uri))]
+    #[instrument(skip(self), fields(from = %request.get_ref().from_uri, to = %request.get_ref().to_uri))]
     async fn initiate_call(
         &self,
         request: Request<InitiateCallRequest>,
     ) -> Result<Response<InitiateCallResponse>, Status> {
-        info!("InitiateCall RPC isteği alındı. Giden çağrı başlatılıyor...");
-        let _req = request.into_inner(); 
-        
-        let new_call_id = format!("call-{}", rand::random::<u32>());
+        let req = request.into_inner();
+        let new_call_id = req.call_id.clone(); // Agent'tan gelen call_id'yi kullanabiliriz veya yeni üretebiliriz.
 
-        Ok(Response::new(InitiateCallResponse {
-            success: true,
-            new_call_id: new_call_id,
-        }))
+        match self.engine.initiate_call(new_call_id.clone(), req.from_uri, req.to_uri).await {
+            Ok(_) => {
+                info!("Çağrı başlatma isteği işleme alındı.");
+                Ok(Response::new(InitiateCallResponse {
+                    success: true,
+                    new_call_id,
+                }))
+            },
+            Err(e) => {
+                error!("Çağrı başlatılamadı: {}", e);
+                Err(Status::internal("Çağrı başlatılamadı"))
+            }
+        }
     }
 
-    #[instrument(skip_all, fields(existing_call = %request.get_ref().existing_call_id))]
     async fn transfer_call(
         &self,
-        request: Request<TransferCallRequest>,
+        _request: Request<TransferCallRequest>,
     ) -> Result<Response<TransferCallResponse>, Status> {
-        info!("TransferCall RPC isteği alındı. Mevcut çağrı aktarılıyor...");
-        let _req = request.into_inner(); 
-
-        Ok(Response::new(TransferCallResponse {
-            success: true,
-        }))
+        Err(Status::unimplemented("Transfer henüz implamente edilmedi."))
     }
 }
