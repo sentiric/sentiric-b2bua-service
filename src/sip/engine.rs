@@ -9,6 +9,7 @@ use crate::grpc::client::InternalClients;
 use crate::sip::state::{CallStore, CallSession, CallState};
 use sentiric_contracts::sentiric::media::v1::AllocatePortRequest;
 use tonic::Request;
+use tokio::net::lookup_host; // DÜZELTME: Eklendi
 
 pub struct B2BuaEngine {
     config: Arc<AppConfig>,
@@ -86,8 +87,23 @@ impl B2BuaEngine {
 
         // 5. Proxy'ye Gönder
         let bytes = invite.to_bytes();
-        self.transport.send(&bytes, self.config.proxy_sip_addr).await?;
-        info!("INVITE gönderildi (Proxy: {})", self.config.proxy_sip_addr);
+        
+        // DÜZELTME: DNS Çözümlemesi
+        match lookup_host(&self.config.proxy_sip_addr).await {
+            Ok(mut addrs) => {
+                if let Some(target_addr) = addrs.next() {
+                    self.transport.send(&bytes, target_addr).await?;
+                    info!("INVITE gönderildi (Proxy IP: {})", target_addr);
+                } else {
+                    error!("DNS Çözümlemesi başarısız (boş sonuç): {}", self.config.proxy_sip_addr);
+                    return Err(anyhow::anyhow!("DNS Resolution Empty"));
+                }
+            },
+            Err(e) => {
+                error!("DNS Çözümleme hatası ({}): {}", self.config.proxy_sip_addr, e);
+                return Err(e.into());
+            }
+        }
 
         Ok(())
     }
@@ -130,8 +146,8 @@ impl B2BuaEngine {
         }
     }
 
-    async fn send_ack(&self, session: &CallSession, resp: &SipPacket) {
-        let mut ack = SipPacket::new_request(Method::Ack, session.to_uri.clone());
+    async fn send_ack(&self, session: &CallSession, _resp: &SipPacket) {
+        // let mut ack = SipPacket::new_request(Method::Ack, session.to_uri.clone());
         // Temel headerları kopyala/oluştur...
         // Basitlik için şimdilik sadece logluyoruz. Gerçek implementasyonda RFC uyumlu ACK oluşturulmalı.
         info!("ACK gönderiliyor (TODO Implementation)...");

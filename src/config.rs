@@ -14,11 +14,12 @@ pub struct AppConfig {
     
     // Dependencies
     pub media_service_url: String,
-    pub proxy_service_url: String, // gRPC için (Gerekirse)
+    pub proxy_service_url: String, // gRPC için
     pub registrar_service_url: String,
     
     // SIP Routing Target (UDP)
-    pub proxy_sip_addr: SocketAddr,
+    // DÜZELTME: Hostname desteklemek için String yapıldı.
+    pub proxy_sip_addr: String,
     
     // Identity
     pub public_ip: String, // SDP ve Contact header için
@@ -44,9 +45,10 @@ impl AppConfig {
         let grpc_addr: SocketAddr = format!("[::]:{}", grpc_port).parse()?;
         let http_addr: SocketAddr = format!("[::]:{}", http_port).parse()?;
         
-        // Proxy SIP Adresi (UDP Forwarding için) - Örn: "https://proxy-service:13074"
-        let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET").unwrap_or_else(|_| "127.0.0.1:13074".to_string());
-        let proxy_sock_addr: SocketAddr = proxy_target.parse().context("Geçersiz Proxy SIP Adresi")?;
+        // Proxy SIP Adresi (UDP Forwarding için) - Örn: "proxy-service:13074"
+        // DÜZELTME: Parse işlemi kaldırıldı.
+        let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
+            .unwrap_or_else(|_| "proxy-service:13074".to_string());
 
         Ok(AppConfig {
             grpc_listen_addr: grpc_addr,
@@ -54,7 +56,7 @@ impl AppConfig {
 
             sip_bind_ip: "0.0.0.0".to_string(),
             sip_port,
-            proxy_sip_addr: proxy_sock_addr,
+            proxy_sip_addr: proxy_target,
 
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),
