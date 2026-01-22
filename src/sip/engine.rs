@@ -45,7 +45,7 @@ impl B2BuaEngine {
         let sdp = format!(
             "v=0\r\n\
             o=- {0} {0} IN IP4 {1}\r\n\
-            s=SentiricB2BUA\r\n\
+            s=Sentiric_B2BUA\r\n\
             c=IN IP4 {1}\r\n\
             t=0 0\r\n\
             m=audio {2} RTP/AVP 18 8 0 101\r\n\
