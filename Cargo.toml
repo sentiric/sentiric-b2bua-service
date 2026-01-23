@@ -18,6 +18,6 @@ rand = "0.8"
 uuid = { version = "1.8", features = ["v4"] }
 dashmap = "5.5" # Thread-safe state map için
 
-# CORE & CONTRACTS
-sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.2.0" }
+# GÜNCELLEME: v1.2.2 etiketini kullan
+sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.2.2" }
 sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.13.3" }
