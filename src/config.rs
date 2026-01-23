@@ -14,15 +14,17 @@ pub struct AppConfig {
     
     // Dependencies
     pub media_service_url: String,
-    pub proxy_service_url: String, // gRPC için
+    pub proxy_service_url: String, 
     pub registrar_service_url: String,
     
+    // YENİ: RabbitMQ
+    pub rabbitmq_url: String,
+    
     // SIP Routing Target (UDP)
-    // DÜZELTME: Hostname desteklemek için String yapıldı.
     pub proxy_sip_addr: String,
     
     // Identity
-    pub public_ip: String, // SDP ve Contact header için
+    pub public_ip: String, 
     
     pub env: String,
     pub rust_log: String,
@@ -45,8 +47,6 @@ impl AppConfig {
         let grpc_addr: SocketAddr = format!("[::]:{}", grpc_port).parse()?;
         let http_addr: SocketAddr = format!("[::]:{}", http_port).parse()?;
         
-        // Proxy SIP Adresi (UDP Forwarding için) - Örn: "proxy-service:13074"
-        // DÜZELTME: Parse işlemi kaldırıldı.
         let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
             .unwrap_or_else(|_| "proxy-service:13074".to_string());
 
@@ -61,6 +61,9 @@ impl AppConfig {
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),
             registrar_service_url: env::var("REGISTRAR_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: REGISTRAR_SERVICE_TARGET_GRPC_URL")?,
+            
+            // YENİ: RabbitMQ
+            rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             
             public_ip: env::var("B2BUA_SERVICE_PUBLIC_IP").unwrap_or_else(|_| "127.0.0.1".to_string()),
 

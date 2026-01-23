@@ -6,6 +6,7 @@ use crate::tls::load_server_tls_config;
 use crate::sip::engine::B2BuaEngine;
 use crate::sip::state::new_store;
 use crate::sip::server::SipServer;
+use crate::rabbitmq::RabbitMqClient; // YENİ
 use anyhow::{Context, Result};
 use sentiric_contracts::sentiric::sip::v1::b2bua_service_server::B2buaServiceServer;
 use std::convert::Infallible;
@@ -66,11 +67,23 @@ impl App {
         let clients = Arc::new(Mutex::new(InternalClients::connect(&self.config).await?));
         let calls = new_store();
 
+        // YENİ: RabbitMQ Bağlantısı
+        info!("RabbitMQ'ya bağlanılıyor: {}", self.config.rabbitmq_url);
+        let rabbitmq_client = Arc::new(RabbitMqClient::new(&self.config.rabbitmq_url).await
+            .context("RabbitMQ bağlantısı başarısız")?);
+
         // 2. Transport & Engine
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
         let transport = Arc::new(SipTransport::new(&bind_addr).await?);
         
-        let engine = Arc::new(B2BuaEngine::new(self.config.clone(), clients, calls, transport.clone()));
+        // DÜZELTME: rabbitmq_client argüman olarak eklendi
+        let engine = Arc::new(B2BuaEngine::new(
+            self.config.clone(), 
+            clients, 
+            calls, 
+            transport.clone(),
+            rabbitmq_client
+        ));
 
         // 3. SIP Server
         let sip_server = SipServer::new(engine.clone(), transport);
@@ -114,8 +127,8 @@ impl App {
         
         tokio::select! {
             res = grpc_server_handle => { if let Err(e) = res? { error!("gRPC Error: {}", e); } },
-            _res = http_server_handle => { error!("HTTP Server durdu"); }, // DÜZELTME: _res
-            _res = sip_handle => { error!("SIP Server durdu"); }, // DÜZELTME: _res
+            _res = http_server_handle => { error!("HTTP Server durdu"); }, 
+            _res = sip_handle => { error!("SIP Server durdu"); }, 
             _ = ctrl_c => { warn!("Kapatma sinyali alındı."); },
         }
 
