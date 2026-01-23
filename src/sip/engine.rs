@@ -2,17 +2,16 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, error, instrument}; // warn kaldırıldı (kullanılmıyordu)
-use sentiric_sip_core::{SipPacket, Method, Header, HeaderName, SipTransport};
+use tracing::{info, error, instrument};
+// DÜZELTME: sip-core'dan utils'i import ediyoruz
+use sentiric_sip_core::{SipPacket, Method, Header, HeaderName, SipTransport, utils as sip_core_utils};
 use crate::config::AppConfig;
 use crate::grpc::client::InternalClients;
 use crate::sip::state::{CallStore, CallSession, CallState};
-// DÜZELTME: ConnectPortsRequest kaldırıldı
 use sentiric_contracts::sentiric::media::v1::AllocatePortRequest;
 use sentiric_contracts::sentiric::sip::v1::LookupContactRequest;
 use tonic::Request;
 use tokio::net::lookup_host;
-// DÜZELTME: uuid::Uuid kaldırıldı (kullanılmıyordu)
 
 pub struct B2BuaEngine {
     config: Arc<AppConfig>,
@@ -36,8 +35,8 @@ impl B2BuaEngine {
         if packet.is_request {
             match packet.method {
                 Method::Invite => self.handle_incoming_invite(packet, src_addr).await,
-                Method::Bye => self.handle_bye(packet).await,
-                Method::Ack => {}, 
+                Method::Bye => self.handle_bye(&packet).await,
+                Method::Ack => self.handle_ack(&packet).await, 
                 _ => {}
             }
         } else {
@@ -57,9 +56,9 @@ impl B2BuaEngine {
         let from = packet.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = packet.get_header_value(HeaderName::To).cloned().unwrap_or_default();
         
-        let target_uri = self.extract_uri(&to);
+        let target_aor = sip_core_utils::extract_aor(&to);
 
-        info!("B2BUA: Gelen Çağrı (Inbound): {} -> {} (ID: {})", from, target_uri, call_id);
+        info!("B2BUA: Gelen Çağrı (Inbound): {} -> {} (ID: {})", from, target_aor, call_id);
 
         // 1. Trying Gönder
         self.send_response(&packet, 100, "Trying", None, src_addr).await;
@@ -67,21 +66,23 @@ impl B2BuaEngine {
         // 2. Registrar'dan Hedefi Bul
         let mut clients = self.clients.lock().await;
         let lookup_res = clients.registrar.lookup_contact(Request::new(LookupContactRequest {
-            sip_uri: target_uri.clone(),
+            sip_uri: target_aor.clone(),
         })).await;
 
         let contact_uri = match lookup_res {
             Ok(res) => {
                 let uris = res.into_inner().contact_uris;
                 if uris.is_empty() {
+                    error!("Registrar Lookup Başarısız: {} bulunamadı.", target_aor);
                     self.send_response(&packet, 404, "Not Found", None, src_addr).await;
                     return;
                 }
+                info!("Registrar Lookup Başarılı: {} -> {}", target_aor, uris[0]);
                 uris[0].clone() 
             },
             Err(e) => {
                 error!("Registrar Lookup Hatası: {}", e);
-                self.send_response(&packet, 500, "Internal Error", None, src_addr).await;
+                self.send_response(&packet, 500, "Internal Server Error", None, src_addr).await;
                 return;
             }
         };
@@ -91,24 +92,21 @@ impl B2BuaEngine {
             call_id: format!("{}_A", call_id),
         })).await;
         
-        let port_b_res = clients.media.allocate_port(Request::new(AllocatePortRequest {
-            call_id: format!("{}_B", call_id),
-        })).await;
-
         drop(clients);
 
-        if port_a_res.is_err() || port_b_res.is_err() {
-            self.send_response(&packet, 503, "Media Error", None, src_addr).await;
-            return;
-        }
+        let port_a = match port_a_res {
+            Ok(res) => res.into_inner().rtp_port,
+            Err(e) => {
+                error!("Media Service AllocatePort hatası: {}", e);
+                self.send_response(&packet, 503, "Media Error", None, src_addr).await;
+                return;
+            }
+        };
 
-        let port_a = port_a_res.unwrap().into_inner().rtp_port;
-        let port_b = port_b_res.unwrap().into_inner().rtp_port;
-
-        // 4. State Kaydet
+        // 4. State Kaydet (Inbound Leg A)
         let session = CallSession {
             call_id: call_id.clone(),
-            state: CallState::Ringing,
+            state: CallState::Trying,
             from_uri: from.clone(),
             to_uri: to.clone(),
             rtp_port: port_a,
@@ -121,19 +119,20 @@ impl B2BuaEngine {
         // 5. Ringing Dön
         self.send_response(&packet, 180, "Ringing", None, src_addr).await;
 
-        // 6. Aranan Kişiye INVITE Gönder
+        // 6. Aranan Kişiye INVITE Gönder (Outbound Leg B)
         let outbound_call_id = format!("{}_B_LEG", call_id);
-        self.initiate_outbound_leg(outbound_call_id, from, target_uri, contact_uri, port_b, call_id).await;
+        self.initiate_outbound_leg(outbound_call_id, from, target_aor, contact_uri, port_a, call_id).await;
     }
 
-    async fn initiate_outbound_leg(&self, call_id: String, from: String, to_uri: String, contact_uri: String, rtp_port: u32, original_call_id: String) {
+    async fn initiate_outbound_leg(&self, call_id: String, from_header: String, to_aor: String, contact_uri: String, rtp_port: u32, original_call_id: String) {
         let sdp = self.create_sdp(rtp_port);
         
-        let mut invite = SipPacket::new_request(Method::Invite, contact_uri.clone());
+        let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}", contact_uri));
         
-        invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch=z9hG4bK-b2bua-{}", self.config.public_ip, self.config.sip_port, call_id)));
-        invite.headers.push(Header::new(HeaderName::From, format!("<{}>;tag=b2bua-{}", from, call_id)));
-        invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to_uri)));
+        let branch = sip_core_utils::generate_branch_id();
+        invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", self.config.public_ip, self.config.sip_port, branch)));
+        invite.headers.push(Header::new(HeaderName::From, from_header.clone()));
+        invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}>", to_aor)));
         invite.headers.push(Header::new(HeaderName::CallId, call_id.clone()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
         invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)));
@@ -144,8 +143,8 @@ impl B2BuaEngine {
         self.calls.insert(call_id.clone(), CallSession {
             call_id: call_id.clone(),
             state: CallState::Trying,
-            from_uri: from,
-            to_uri: to_uri,
+            from_uri: from_header,
+            to_uri: to_aor,
             rtp_port,
             remote_tag: None,
             peer_call_id: Some(original_call_id),
@@ -160,25 +159,26 @@ impl B2BuaEngine {
                     info!("Outbound INVITE gönderildi (ID: {}) -> {}", call_id, target_addr);
                 }
             },
-            Err(e) => error!("DNS Hatası: {}", e),
+            Err(e) => error!("Proxy DNS Hatası ({}): {}", self.config.proxy_sip_addr, e),
         }
     }
 
     async fn handle_response(&self, session: &mut CallSession, packet: &SipPacket) {
-        if packet.status_code == 200 {
-            info!("Outbound Leg Cevaplandı: {}", session.call_id);
+        if packet.status_code >= 200 && packet.status_code < 300 {
+            info!("Outbound Leg Cevaplandı (2xx): {}", session.call_id);
             session.state = CallState::Established;
 
             if let Some(peer_id) = &session.peer_call_id {
-                if let Some(peer_session) = self.calls.get(peer_id) {
+                if let Some(mut peer_session) = self.calls.get_mut(peer_id) {
+                    peer_session.state = CallState::Established;
                     if let Some(src_addr) = peer_session.source_addr {
-                        // Arayana 200 OK Gönder
                         let sdp = self.create_sdp(peer_session.rtp_port);
                         
                         let mut resp = SipPacket::new_response(200, "OK".to_string());
-                        resp.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch=z9hG4bK-proxy-pass", self.config.public_ip, self.config.sip_port))); 
+                        
+                        resp.headers.push(Header::new(HeaderName::Via, packet.get_header_value(HeaderName::Via).cloned().unwrap_or_default()));
                         resp.headers.push(Header::new(HeaderName::From, peer_session.from_uri.clone()));
-                        resp.headers.push(Header::new(HeaderName::To, format!("{};tag=b2bua-Tag", peer_session.to_uri)));
+                        resp.headers.push(Header::new(HeaderName::To, format!("{};tag={}", peer_session.to_uri, sip_core_utils::generate_tag(&peer_session.call_id))));
                         resp.headers.push(Header::new(HeaderName::CallId, peer_session.call_id.clone()));
                         resp.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
                         resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)));
@@ -193,19 +193,19 @@ impl B2BuaEngine {
         }
     }
 
-    // DÜZELTME: packet parametresinin önüne _ eklendi
-    async fn handle_bye(&self, _packet: SipPacket) {
+    async fn handle_ack(&self, _packet: &SipPacket) {
+        // State'i güncelle
+    }
+
+    async fn handle_bye(&self, _packet: &SipPacket) {
         // BYE logic
     }
 
     async fn send_response(&self, req: &SipPacket, code: u16, reason: &str, body: Option<String>, target: std::net::SocketAddr) {
         let mut resp = SipPacket::new_response(code, reason.to_string());
         for h in &req.headers {
-            match h.name {
-                HeaderName::Via | HeaderName::From | HeaderName::To | HeaderName::CallId | HeaderName::CSeq => {
-                    resp.headers.push(h.clone());
-                },
-                _ => {}
+            if let HeaderName::Via | HeaderName::From | HeaderName::To | HeaderName::CallId | HeaderName::CSeq = h.name {
+                resp.headers.push(h.clone());
             }
         }
         resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
@@ -227,31 +227,22 @@ impl B2BuaEngine {
             s=Sentiric_B2BUA\r\n\
             c=IN IP4 {1}\r\n\
             t=0 0\r\n\
-            m=audio {2} RTP/AVP 0 8 101\r\n\
+            m=audio {2} RTP/AVP 0 8 18 101\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
             a=rtpmap:8 PCMA/8000\r\n\
+            a=rtpmap:18 G729/8000\r\n\
             a=rtpmap:101 telephone-event/8000\r\n\
             a=fmtp:101 0-16\r\n\
             a=sendrecv\r\n",
-            12345,
+            rand::random::<u64>(),
             self.config.public_ip,
             port
         )
     }
 
-    fn extract_uri(&self, header_val: &str) -> String {
-        if let Some(start) = header_val.find("sip:") {
-            if let Some(end) = header_val[start..].find('>') {
-                return header_val[start..start+end].to_string();
-            } else if let Some(end) = header_val[start..].find(';') {
-                return header_val[start..start+end].to_string();
-            }
-            return header_val[start..].to_string();
-        }
-        header_val.to_string()
-    }
-    
-    // DÜZELTME: Parametrelerin önüne _ eklendi
+    // DÜZELTME: Bu fonksiyon tamamen silindi.
+    // fn extract_uri(&self, header_val: &str) -> String { ... }
+
     pub async fn initiate_call(&self, call_id: String, _from: String, _to: String) -> anyhow::Result<()> {
         info!("System initiated call: {}", call_id);
         Ok(())
