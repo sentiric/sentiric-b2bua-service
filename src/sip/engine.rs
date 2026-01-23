@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, error, instrument};
-// DÜZELTME: sip-core'dan utils'i import ediyoruz
 use sentiric_sip_core::{SipPacket, Method, Header, HeaderName, SipTransport, utils as sip_core_utils};
 use crate::config::AppConfig;
 use crate::grpc::client::InternalClients;
@@ -53,57 +52,65 @@ impl B2BuaEngine {
     #[instrument(skip(self, packet))]
     async fn handle_incoming_invite(&self, packet: SipPacket, src_addr: std::net::SocketAddr) {
         let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
+
+        // --- TRANSACTION STATE KONTROLÜ ---
+        if self.calls.contains_key(&call_id) {
+            info!(%call_id, "INVITE retransmission detected. Resending 180 Ringing.");
+            self.send_response(&packet, 180, "Ringing", None, src_addr).await;
+            return;
+        }
+        // --- KONTROL SONU ---
+
         let from = packet.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = packet.get_header_value(HeaderName::To).cloned().unwrap_or_default();
         
         let target_aor = sip_core_utils::extract_aor(&to);
 
-        info!("B2BUA: Gelen Çağrı (Inbound): {} -> {} (ID: {})", from, target_aor, call_id);
+        info!(%call_id, "B2BUA: Yeni Gelen Çağrı (Inbound): {} -> {}", from, target_aor);
 
         // 1. Trying Gönder
         self.send_response(&packet, 100, "Trying", None, src_addr).await;
 
         // 2. Registrar'dan Hedefi Bul
-        let mut clients = self.clients.lock().await;
-        let lookup_res = clients.registrar.lookup_contact(Request::new(LookupContactRequest {
-            sip_uri: target_aor.clone(),
-        })).await;
-
-        let contact_uri = match lookup_res {
-            Ok(res) => {
-                let uris = res.into_inner().contact_uris;
-                if uris.is_empty() {
-                    error!("Registrar Lookup Başarısız: {} bulunamadı.", target_aor);
-                    self.send_response(&packet, 404, "Not Found", None, src_addr).await;
+        let contact_uri = {
+            let mut clients = self.clients.lock().await;
+            match clients.registrar.lookup_contact(Request::new(LookupContactRequest {
+                sip_uri: target_aor.clone(),
+            })).await {
+                Ok(res) => {
+                    let uris = res.into_inner().contact_uris;
+                    if uris.is_empty() {
+                        error!("Registrar Lookup Başarısız: {} bulunamadı.", target_aor);
+                        self.send_response(&packet, 404, "Not Found", None, src_addr).await;
+                        return;
+                    }
+                    info!("Registrar Lookup Başarılı: {} -> {}", target_aor, uris[0]);
+                    uris[0].clone() 
+                },
+                Err(e) => {
+                    error!("Registrar Lookup Hatası: {}", e);
+                    self.send_response(&packet, 500, "Internal Server Error", None, src_addr).await;
                     return;
                 }
-                info!("Registrar Lookup Başarılı: {} -> {}", target_aor, uris[0]);
-                uris[0].clone() 
-            },
-            Err(e) => {
-                error!("Registrar Lookup Hatası: {}", e);
-                self.send_response(&packet, 500, "Internal Server Error", None, src_addr).await;
-                return;
             }
         };
 
         // 3. Medya Portlarını Ayır
-        let port_a_res = clients.media.allocate_port(Request::new(AllocatePortRequest {
-            call_id: format!("{}_A", call_id),
-        })).await;
-        
-        drop(clients);
-
-        let port_a = match port_a_res {
-            Ok(res) => res.into_inner().rtp_port,
-            Err(e) => {
-                error!("Media Service AllocatePort hatası: {}", e);
-                self.send_response(&packet, 503, "Media Error", None, src_addr).await;
-                return;
+        let port_a = {
+            let mut clients = self.clients.lock().await;
+            match clients.media.allocate_port(Request::new(AllocatePortRequest {
+                call_id: format!("{}_A", call_id),
+            })).await {
+                Ok(res) => res.into_inner().rtp_port,
+                Err(e) => {
+                    error!("Media Service AllocatePort hatası: {}", e);
+                    self.send_response(&packet, 503, "Media Service Unavailable", None, src_addr).await;
+                    return; // State'e kaydetmeden çık
+                }
             }
         };
 
-        // 4. State Kaydet (Inbound Leg A)
+        // 4. State Kaydet (Inbound Leg A) - Sadece ilk başarılı işlemde
         let session = CallSession {
             call_id: call_id.clone(),
             state: CallState::Trying,
@@ -239,9 +246,6 @@ impl B2BuaEngine {
             port
         )
     }
-
-    // DÜZELTME: Bu fonksiyon tamamen silindi.
-    // fn extract_uri(&self, header_val: &str) -> String { ... }
 
     pub async fn initiate_call(&self, call_id: String, _from: String, _to: String) -> anyhow::Result<()> {
         info!("System initiated call: {}", call_id);
