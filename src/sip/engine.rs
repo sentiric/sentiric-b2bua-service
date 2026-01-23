@@ -134,15 +134,36 @@ impl B2BuaEngine {
     async fn initiate_outbound_leg(&self, call_id: String, from_header: String, to_aor: String, contact_uri: String, rtp_port: u32, original_call_id: String) {
         let sdp = self.create_sdp(rtp_port);
         
-        let mut invite = SipPacket::new_request(Method::Invite, format!("sip:{}", contact_uri));
+        // --- KRİTİK DÜZELTME BAŞLANGICI ---
+        // Request-URI, kullanıcının gerçek adresini içermelidir.
+        // `contact_uri` zaten `user@ip:port` formatında geliyor olmalı.
+        // Güvenli olmak için 'sip:' ön ekini ekliyoruz.
+        let request_uri = if !contact_uri.starts_with("sip:") {
+            format!("sip:{}", contact_uri)
+        } else {
+            contact_uri.clone()
+        };
+        
+        let mut invite = SipPacket::new_request(Method::Invite, request_uri);
+        // --- KRİTİK DÜZELTME SONU ---
         
         let branch = sip_core_utils::generate_branch_id();
+        // Via başlığı, B2BUA'nın public IP'sini içermelidir ki Proxy yanıtı geri döndürebilsin.
         invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", self.config.public_ip, self.config.sip_port, branch)));
+        
+        // From başlığı, orijinal arayanı yansıtmalıdır.
         invite.headers.push(Header::new(HeaderName::From, from_header.clone()));
+
+        // To başlığı, mantıksal hedefi (AOR) göstermelidir.
         invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}>", to_aor)));
+
         invite.headers.push(Header::new(HeaderName::CallId, call_id.clone()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
+        
+        // Contact başlığı, bu çağrı bacağının sahibinin B2BUA olduğunu söyler.
+        // Yanıtlar ve sonraki istekler (BYE gibi) bu adrese gelir.
         invite.headers.push(Header::new(HeaderName::Contact, format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)));
+        
         invite.headers.push(Header::new(HeaderName::UserAgent, "Sentiric B2BUA".to_string()));
         invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         invite.body = sdp.as_bytes().to_vec();
