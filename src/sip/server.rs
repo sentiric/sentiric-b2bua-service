@@ -31,13 +31,14 @@ impl SipServer {
                 
                 res = socket.recv_from(&mut buf) => {
                     match res {
-                        Ok((len, _src_addr)) => {
+                        Ok((len, src_addr)) => {
                             let data = &buf[..len];
                             match parser::parse(data) {
                                 Ok(packet) => {
                                     let engine = self.engine.clone();
+                                    // DÜZELTME: src_addr parametresi eklendi
                                     tokio::spawn(async move {
-                                        engine.handle_packet(packet).await;
+                                        engine.handle_packet(packet, src_addr).await;
                                     });
                                 },
                                 Err(e) => {
