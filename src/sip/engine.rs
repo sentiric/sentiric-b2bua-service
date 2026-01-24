@@ -10,29 +10,12 @@ use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use sentiric_contracts::sentiric::media::v1::AllocatePortRequest;
 use sentiric_contracts::sentiric::sip::v1::LookupContactRequest;
+
+// GÜNCELLEME: Protobuf event mesajları import edildi
+use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, MediaInfo};
+use prost::Message; // Protobuf encode için gerekli
 use tonic::Request;
 use tokio::net::lookup_host;
-use serde::Serialize;
-
-// Olay Yapıları (Agent Service ile uyumlu)
-// DÜZELTME: Alan adları snake_case yapıldı, JSON çıktısı için rename_all kullanıldı.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaInfo {
-    caller_rtp_addr: String,
-    server_rtp_port: u32,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CallStartedEvent {
-    event_type: String,
-    call_id: String,
-    trace_id: String,
-    from_uri: String,
-    to_uri: String,
-    media_info: MediaInfo,
-}
 
 pub struct B2BuaEngine {
     config: Arc<AppConfig>,
@@ -70,11 +53,10 @@ impl B2BuaEngine {
         }
     }
 
-    // --- gRPC Tarafından Çağrılan Metot ---
+    // gRPC üzerinden tetiklenen Outbound Arama
     pub async fn initiate_call(&self, call_id: String, from_uri: String, to_uri: String) -> anyhow::Result<()> {
         info!("gRPC InitiateCall İsteği: ID={} From={} To={}", call_id, from_uri, to_uri);
 
-        // 1. Hedefin gerçek adresini bul (Registrar)
         let contact_uri = {
             let mut clients = self.clients.lock().await;
             match clients.registrar.lookup_contact(Request::new(LookupContactRequest {
@@ -91,7 +73,6 @@ impl B2BuaEngine {
             }
         };
 
-        // 2. Medya Portu Ayır
         let rtp_port = {
             let mut clients = self.clients.lock().await;
             match clients.media.allocate_port(Request::new(AllocatePortRequest {
@@ -102,9 +83,7 @@ impl B2BuaEngine {
             }
         };
 
-        // 3. INVITE Gönder
         self.initiate_outbound_leg(call_id.clone(), from_uri, to_uri, contact_uri, rtp_port, "OUTBOUND_INIT".to_string()).await;
-        
         Ok(())
     }
 
@@ -126,7 +105,7 @@ impl B2BuaEngine {
         info!(%call_id, "B2BUA: Incoming Call: {} -> {}", from, target_aor);
         self.send_response(&packet, 100, "Trying", None, src_addr).await;
 
-        // 1. Registrar Lookup
+        // 1. Registrar Lookup (Dahili abone mi?)
         let contact_uri = {
             let mut clients = self.clients.lock().await;
             match clients.registrar.lookup_contact(Request::new(LookupContactRequest {
@@ -143,7 +122,7 @@ impl B2BuaEngine {
             }
         };
 
-        // 2. Medya Portu Ayırma
+        // 2. Medya Portu Ayırma (Her senaryo için gerekli)
         let port_a = {
             let mut clients = self.clients.lock().await;
             match clients.media.allocate_port(Request::new(AllocatePortRequest {
@@ -160,6 +139,7 @@ impl B2BuaEngine {
 
         // 3. Senaryo Kararı
         if let Some(target_contact) = contact_uri {
+            // Dahili Aboneye Çağrı (Bridge)
             info!("Target is a User. Bridging to {}", target_contact);
             let session = CallSession {
                 call_id: call_id.clone(),
@@ -176,6 +156,7 @@ impl B2BuaEngine {
             let outbound_call_id = format!("{}_B_LEG", call_id);
             self.initiate_outbound_leg(outbound_call_id, from, target_aor, target_contact, port_a, call_id).await;
         } else {
+            // AI Çağrısı (Agent Service'e Event Bas)
             info!("Target NOT found in Registrar. Treating as SYSTEM/AI call.");
             let sdp = self.create_sdp(port_a);
             self.send_response(&packet, 200, "OK", Some(sdp), src_addr).await;
@@ -192,23 +173,31 @@ impl B2BuaEngine {
             };
             self.calls.insert(call_id.clone(), session);
 
-            // DÜZELTME: Struct alanları snake_case olarak güncellendi.
-            // Serde sayesinde JSON çıktısı hala camelCase olacak.
+            // [KRITIK GÜNCELLEME]: Protobuf Event Yayınlama
+            let timestamp = Some(prost_types::Timestamp::from(std::time::SystemTime::now()));
+            
             let event = CallStartedEvent {
                 event_type: "call.started".to_string(),
-                call_id: call_id.clone(),
                 trace_id: call_id.clone(),
+                call_id: call_id.clone(),
                 from_uri: from_aor,
                 to_uri: target_aor,
-                media_info: MediaInfo {
-                    caller_rtp_addr: src_addr.ip().to_string(), 
+                timestamp,
+                media_info: Some(MediaInfo {
+                    caller_rtp_addr: src_addr.ip().to_string(),
                     server_rtp_port: port_a,
-                },
+                }),
+                dialplan_resolution: None, // B2BUA dialplan yapmaz, Agent yapacak
             };
-            if let Err(e) = self.rabbitmq.publish_event("call.started", &event).await {
-                error!("Failed to publish call.started event: {}", e);
+            
+            // Encode to bytes
+            let payload = event.encode_to_vec();
+
+            // RabbitMQ'ya binary olarak bas
+            if let Err(e) = self.rabbitmq.publish_event_bytes("call.started", &payload).await {
+                error!("Failed to publish PROTOBUF call.started event: {}", e);
             } else {
-                info!("🚀 call.started event published for Agent Service.");
+                info!("🚀 call.started PROTOBUF event published ({} bytes).", payload.len());
             }
         }
     }
@@ -227,6 +216,7 @@ impl B2BuaEngine {
         let mut invite = SipPacket::new_request(Method::Invite, request_uri);
         let branch = sip_core_utils::generate_branch_id();
         
+        // Via başlığına Public IP yazıyoruz ki Proxy dönüş yolunu bilsin
         invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", self.config.public_ip, self.config.sip_port, branch)));
         invite.headers.push(Header::new(HeaderName::From, from_header.clone()));
         invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}>", to_aor)));

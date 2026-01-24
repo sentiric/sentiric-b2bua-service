@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use lapin::{options::*, BasicProperties, Channel, Connection, ConnectionProperties};
-use serde::Serialize;
+// serde importu kaldırıldı çünkü binary için gerek yok
 use tracing::{info, debug};
 use std::sync::Arc;
 
@@ -20,20 +20,19 @@ impl RabbitMqClient {
         })
     }
 
-    pub async fn publish_event<T: Serialize>(&self, routing_key: &str, event: &T) -> Result<()> {
-        let payload = serde_json::to_vec(event)?;
-        
+    // YENİ METOT: Binary Veri Yayınlama
+    pub async fn publish_event_bytes(&self, routing_key: &str, payload: &[u8]) -> Result<()> {
         self.channel
             .basic_publish(
-                "sentiric_events", // Exchange name (Infrastructure tarafında tanımlı)
+                "sentiric_events", 
                 routing_key,
                 BasicPublishOptions::default(),
-                &payload,
+                payload, // Direkt binary data
                 BasicProperties::default().with_delivery_mode(2), // Persistent
             )
             .await?;
             
-        debug!("Event yayınlandı: {}", routing_key);
+        debug!("Binary Event yayınlandı: {} ({} bytes)", routing_key, payload.len());
         Ok(())
     }
 }
