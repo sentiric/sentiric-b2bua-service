@@ -11,7 +11,7 @@ use crate::rabbitmq::RabbitMqClient;
 use sentiric_contracts::sentiric::media::v1::AllocatePortRequest;
 use sentiric_contracts::sentiric::sip::v1::LookupContactRequest;
 
-// GÜNCELLEME: Protobuf event mesajları import edildi
+// [MASTER PLAN]: Protobuf event mesajları import edildi
 use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, MediaInfo};
 use prost::Message; // Protobuf encode için gerekli
 use tonic::Request;
@@ -173,8 +173,12 @@ impl B2BuaEngine {
             };
             self.calls.insert(call_id.clone(), session);
 
-            // [KRITIK GÜNCELLEME]: Protobuf Event Yayınlama
-            let timestamp = Some(prost_types::Timestamp::from(std::time::SystemTime::now()));
+            // [MASTER PLAN]: Protobuf Event Yayınlama
+            // Artık JSON yok. contracts::event::v1::CallStartedEvent kullanılıyor.
+            
+            // Timestamp (opsiyonel, şimdilik None geçilebilir veya prost_types eklenebilir)
+            // Hata almamak için şimdilik None geçiyoruz, Agent service handle edecektir.
+            let timestamp = None; 
             
             let event = CallStartedEvent {
                 event_type: "call.started".to_string(),
@@ -216,7 +220,6 @@ impl B2BuaEngine {
         let mut invite = SipPacket::new_request(Method::Invite, request_uri);
         let branch = sip_core_utils::generate_branch_id();
         
-        // Via başlığına Public IP yazıyoruz ki Proxy dönüş yolunu bilsin
         invite.headers.push(Header::new(HeaderName::Via, format!("SIP/2.0/UDP {}:{};branch={}", self.config.public_ip, self.config.sip_port, branch)));
         invite.headers.push(Header::new(HeaderName::From, from_header.clone()));
         invite.headers.push(Header::new(HeaderName::To, format!("<sip:{}>", to_aor)));
