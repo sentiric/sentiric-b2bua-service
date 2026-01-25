@@ -11,7 +11,7 @@ use crate::rabbitmq::RabbitMqClient;
 use sentiric_contracts::sentiric::media::v1::AllocatePortRequest;
 use sentiric_contracts::sentiric::sip::v1::LookupContactRequest;
 
-// [MASTER PLAN]: Protobuf event mesajları import edildi
+// [YENİ]: Protobuf event mesajları import edildi
 use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, MediaInfo};
 use prost::Message; // Protobuf encode için gerekli
 use tonic::Request;
@@ -173,11 +173,10 @@ impl B2BuaEngine {
             };
             self.calls.insert(call_id.clone(), session);
 
-            // [MASTER PLAN]: Protobuf Event Yayınlama
+            // [DÜZELTME]: Protobuf Event Yayınlama
             // Artık JSON yok. contracts::event::v1::CallStartedEvent kullanılıyor.
             
-            // Timestamp (opsiyonel, şimdilik None geçilebilir veya prost_types eklenebilir)
-            // Hata almamak için şimdilik None geçiyoruz, Agent service handle edecektir.
+            // Timestamp opsiyonel, şimdilik None.
             let timestamp = None; 
             
             let event = CallStartedEvent {
@@ -187,6 +186,7 @@ impl B2BuaEngine {
                 from_uri: from_aor,
                 to_uri: target_aor,
                 timestamp,
+                // MediaInfo artık map değil, struct.
                 media_info: Some(MediaInfo {
                     caller_rtp_addr: src_addr.ip().to_string(),
                     server_rtp_port: port_a,
