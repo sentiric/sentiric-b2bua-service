@@ -10,10 +10,8 @@ use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use sentiric_contracts::sentiric::media::v1::AllocatePortRequest;
 use sentiric_contracts::sentiric::sip::v1::LookupContactRequest;
-
-// [YENİ]: Protobuf event mesajları import edildi
 use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, MediaInfo};
-use prost::Message; // Protobuf encode için gerekli
+use prost::Message;
 use tonic::Request;
 use tokio::net::lookup_host;
 
@@ -53,7 +51,6 @@ impl B2BuaEngine {
         }
     }
 
-    // gRPC üzerinden tetiklenen Outbound Arama
     pub async fn initiate_call(&self, call_id: String, from_uri: String, to_uri: String) -> anyhow::Result<()> {
         info!("gRPC InitiateCall İsteği: ID={} From={} To={}", call_id, from_uri, to_uri);
 
@@ -64,6 +61,7 @@ impl B2BuaEngine {
             })).await {
                 Ok(res) => {
                     let uris = res.into_inner().contact_uris;
+                    // DÜZELTME: is_empty -> is_empty()
                     if uris.is_empty() {
                         return Err(anyhow::anyhow!("Hedef kullanıcı kayıtlı değil: {}", to_uri));
                     }
@@ -91,9 +89,17 @@ impl B2BuaEngine {
     async fn handle_incoming_invite(&self, packet: SipPacket, src_addr: std::net::SocketAddr) {
         let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
 
-        if self.calls.contains_key(&call_id) {
-            info!(%call_id, "INVITE retransmission. 180 Ringing.");
-            self.send_response(&packet, 180, "Ringing", None, src_addr).await;
+        if let Some(session) = self.calls.get(&call_id) {
+            warn!(%call_id, "INVITE retransmission algılandı.");
+            if session.state == CallState::Established {
+                 if let Some(sdp) = &session.last_sdp {
+                     info!("Önceki 200 OK (SDP ile) tekrar gönderiliyor...");
+                     self.send_response(&packet, 200, "OK", Some(sdp.clone()), src_addr).await;
+                 }
+            } else {
+                 info!("180 Ringing (Retransmission) gönderiliyor...");
+                 self.send_response(&packet, 180, "Ringing", None, src_addr).await;
+            }
             return;
         }
 
@@ -105,7 +111,6 @@ impl B2BuaEngine {
         info!(%call_id, "B2BUA: Incoming Call: {} -> {}", from, target_aor);
         self.send_response(&packet, 100, "Trying", None, src_addr).await;
 
-        // 1. Registrar Lookup (Dahili abone mi?)
         let contact_uri = {
             let mut clients = self.clients.lock().await;
             match clients.registrar.lookup_contact(Request::new(LookupContactRequest {
@@ -115,14 +120,10 @@ impl B2BuaEngine {
                     let uris = res.into_inner().contact_uris;
                     if !uris.is_empty() { Some(uris[0].clone()) } else { None }
                 },
-                Err(e) => {
-                    warn!("Registrar Lookup Hatası: {}", e);
-                    None
-                }
+                Err(e) => { warn!("Registrar Lookup Hatası: {}", e); None }
             }
         };
 
-        // 2. Medya Portu Ayırma (Her senaryo için gerekli)
         let port_a = {
             let mut clients = self.clients.lock().await;
             match clients.media.allocate_port(Request::new(AllocatePortRequest {
@@ -137,67 +138,50 @@ impl B2BuaEngine {
             }
         };
 
-        // 3. Senaryo Kararı
         if let Some(target_contact) = contact_uri {
-            // Dahili Aboneye Çağrı (Bridge)
             info!("Target is a User. Bridging to {}", target_contact);
             let session = CallSession {
-                call_id: call_id.clone(),
+                call_id: call_id.clone(), // DÜZELTME: Eksik alan eklendi
                 state: CallState::Trying,
-                from_uri: from.clone(),
-                to_uri: to.clone(),
-                rtp_port: port_a,
-                remote_tag: None,
+                from_uri: from.clone(), to_uri: to.clone(),
+                rtp_port: port_a, remote_tag: None,
                 peer_call_id: Some(format!("{}_B_LEG", call_id)),
                 source_addr: Some(src_addr),
+                last_sdp: None,
             };
             self.calls.insert(call_id.clone(), session);
             self.send_response(&packet, 180, "Ringing", None, src_addr).await;
             let outbound_call_id = format!("{}_B_LEG", call_id);
             self.initiate_outbound_leg(outbound_call_id, from, target_aor, target_contact, port_a, call_id).await;
         } else {
-            // AI Çağrısı (Agent Service'e Event Bas)
             info!("Target NOT found in Registrar. Treating as SYSTEM/AI call.");
             let sdp = self.create_sdp(port_a);
-            self.send_response(&packet, 200, "OK", Some(sdp), src_addr).await;
+            self.send_response(&packet, 200, "OK", Some(sdp.clone()), src_addr).await;
             
             let session = CallSession {
-                call_id: call_id.clone(),
+                call_id: call_id.clone(), // DÜZELTME: Eksik alan eklendi
                 state: CallState::Established,
-                from_uri: from.clone(),
-                to_uri: to.clone(),
-                rtp_port: port_a,
-                remote_tag: None,
+                from_uri: from.clone(), to_uri: to.clone(),
+                rtp_port: port_a, remote_tag: None,
                 peer_call_id: None, 
                 source_addr: Some(src_addr),
+                last_sdp: Some(sdp),
             };
             self.calls.insert(call_id.clone(), session);
 
-            // [DÜZELTME]: Protobuf Event Yayınlama
-            // Artık JSON yok. contracts::event::v1::CallStartedEvent kullanılıyor.
-            
-            // Timestamp opsiyonel, şimdilik None.
-            let timestamp = None; 
-            
             let event = CallStartedEvent {
                 event_type: "call.started".to_string(),
-                trace_id: call_id.clone(),
-                call_id: call_id.clone(),
-                from_uri: from_aor,
-                to_uri: target_aor,
-                timestamp,
-                // MediaInfo artık map değil, struct.
+                trace_id: call_id.clone(), call_id: call_id.clone(),
+                from_uri: from_aor, to_uri: target_aor,
+                timestamp: None,
                 media_info: Some(MediaInfo {
                     caller_rtp_addr: src_addr.ip().to_string(),
                     server_rtp_port: port_a,
                 }),
-                dialplan_resolution: None, // B2BUA dialplan yapmaz, Agent yapacak
+                dialplan_resolution: None,
             };
             
-            // Encode to bytes
             let payload = event.encode_to_vec();
-
-            // RabbitMQ'ya binary olarak bas
             if let Err(e) = self.rabbitmq.publish_event_bytes("call.started", &payload).await {
                 error!("Failed to publish PROTOBUF call.started event: {}", e);
             } else {
@@ -231,7 +215,7 @@ impl B2BuaEngine {
         invite.body = sdp.as_bytes().to_vec();
 
         self.calls.insert(call_id.clone(), CallSession {
-            call_id: call_id.clone(),
+            call_id: call_id.clone(), // DÜZELTME: Eksik alan eklendi
             state: CallState::Trying,
             from_uri: from_header,
             to_uri: to_aor,
@@ -239,6 +223,7 @@ impl B2BuaEngine {
             remote_tag: None,
             peer_call_id: Some(original_call_id),
             source_addr: None,
+            last_sdp: Some(sdp),
         });
 
         let bytes = invite.to_bytes();
@@ -263,6 +248,9 @@ impl B2BuaEngine {
                     peer_session.state = CallState::Established;
                     if let Some(src_addr) = peer_session.source_addr {
                         let sdp = self.create_sdp(peer_session.rtp_port);
+                        
+                        peer_session.last_sdp = Some(sdp.clone());
+
                         self.send_response(packet, 200, "OK", Some(sdp), src_addr).await; 
                     }
                 }

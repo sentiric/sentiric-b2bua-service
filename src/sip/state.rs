@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use dashmap::DashMap;
-use std::net::SocketAddr; // EKLENDİ
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct CallSession {
@@ -12,9 +12,11 @@ pub struct CallSession {
     pub to_uri: String,
     pub rtp_port: u32,
     pub remote_tag: Option<String>,
-    // YENİ ALANLAR: Bridging için
+    // Bridging için
     pub peer_call_id: Option<String>,
     pub source_addr: Option<SocketAddr>,
+    // [YENİ EKLENDİ] Retransmission için son gönderilen SDP'yi saklar.
+    pub last_sdp: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
