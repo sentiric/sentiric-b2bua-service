@@ -16,21 +16,18 @@ pub struct AppConfig {
     pub media_service_url: String,
     pub proxy_service_url: String, 
     pub registrar_service_url: String,
-    
-    // YENİ: RabbitMQ
     pub rabbitmq_url: String,
     
-    // SIP Routing Target (UDP)
     pub proxy_sip_addr: String,
-    
-    // Identity
     pub public_ip: String, 
+    
+    // --- YENİ: Vendor Profile ---
+    pub vendor_profile: String,
     
     pub env: String,
     pub rust_log: String,
     pub service_version: String,
     
-    // TLS
     pub cert_path: String,
     pub key_path: String,
     pub ca_path: String,
@@ -61,11 +58,12 @@ impl AppConfig {
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),
             registrar_service_url: env::var("REGISTRAR_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: REGISTRAR_SERVICE_TARGET_GRPC_URL")?,
-            
-            // YENİ: RabbitMQ
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             
             public_ip: env::var("B2BUA_SERVICE_PUBLIC_IP").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            
+            // YENİ: Varsayılan olarak 'legacy' yapıyoruz ki uyumluluk artsın
+            vendor_profile: env::var("VENDOR_PROFILE").unwrap_or_else(|_| "legacy".to_string()),
 
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
             rust_log: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),

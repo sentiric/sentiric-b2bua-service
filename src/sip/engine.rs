@@ -10,7 +10,7 @@ use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
 use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
-use std::net::{SocketAddr, IpAddr}; // IpAddr eklendi
+use std::net::{SocketAddr, IpAddr};
 use uuid::Uuid;
 
 pub struct B2BuaEngine {
@@ -70,8 +70,7 @@ impl B2BuaEngine {
         self.copy_headers(&mut trying, &req);
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
-        // 2. SDP Analizi (Caller RTP IP/Port Çözümleme)
-        // Eğer SDP'den IP çözemezsek, kaynak IP'yi (src_addr) varsayarız.
+        // 2. SDP Analizi
         let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
         let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
         info!("🎯 Caller RTP Target Resolved: {}", rtp_target_str);
@@ -102,13 +101,16 @@ impl B2BuaEngine {
         self.calls.insert(call_id.clone(), session);
 
         // 5. 200 OK (SDP)
+        // SIP UAS'taki gibi G.729 öncelikli ve sade SDP
         let sdp = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
             s=SentiricB2BUA\r\n\
             c=IN IP4 {}\r\n\
             t=0 0\r\n\
-            m=audio {} RTP/AVP 0 8 101\r\n\
+            m=audio {} RTP/AVP 18 0 8 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=fmtp:18 annexb=no\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
             a=rtpmap:8 PCMA/8000\r\n\
             a=rtpmap:101 telephone-event/8000\r\n\
@@ -121,8 +123,23 @@ impl B2BuaEngine {
 
         let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers_with_tag(&mut ok_resp, &req, &local_tag);
-        let contact = format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port);
+        
+        // --- VENDOR PROFILE LOGIC (KRİTİK BÖLÜM) ---
+        let contact = if self.config.vendor_profile == "legacy" {
+            // Legacy (SBC Uyumlu): <sip:IP:PORT> (User part YOK)
+            format!("<sip:{}:{}>", self.config.public_ip, self.config.sip_port)
+        } else {
+            // Standard: <sip:user@IP:PORT>
+            format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)
+        };
+        
         ok_resp.headers.push(Header::new(HeaderName::Contact, contact));
+        
+        // Operatörlerin sevdiği ek başlıklar
+        ok_resp.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
+        ok_resp.headers.push(Header::new(HeaderName::Supported, "replaces, timer".to_string()));
+        ok_resp.headers.push(Header::new(HeaderName::UserAgent, "Sentiric B2BUA".to_string()));
+        
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         ok_resp.body = sdp.as_bytes().to_vec();
 
@@ -138,8 +155,7 @@ impl B2BuaEngine {
             info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
         }
 
-        // 6. IVR / Anons Başlat (Doğru Hedef Adres ile)
-        // Artık rtp_target_str (Gerçek IP) kullanıyoruz, 0.0.0.0 değil.
+        // 6. IVR / Anons Başlat
         self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
     }
 
@@ -148,6 +164,8 @@ impl B2BuaEngine {
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             session.state = CallState::Established;
             info!("✅ [ACK] Call Established: {}", call_id);
+        } else {
+            warn!("⚠️ [ACK] Received for unknown call: {}", call_id);
         }
     }
 
@@ -166,14 +184,12 @@ impl B2BuaEngine {
 
     // --- Helpers ---
 
-    /// SDP Body içinden karşı tarafın IP ve Port bilgisini çıkarır.
     fn extract_sdp_info(&self, body: &[u8]) -> Option<(IpAddr, u16)> {
         let sdp_str = std::str::from_utf8(body).ok()?;
         let mut ip: Option<IpAddr> = None;
         let mut port: Option<u16> = None;
 
         for line in sdp_str.lines() {
-            // c=IN IP4 192.168.1.1
             if line.starts_with("c=IN IP4") {
                 if let Some(ip_str) = line.split_whitespace().last() {
                     if let Ok(parsed_ip) = ip_str.parse::<IpAddr>() {
@@ -181,7 +197,6 @@ impl B2BuaEngine {
                     }
                 }
             }
-            // m=audio 12345 RTP/AVP ...
             if line.starts_with("m=audio") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
@@ -220,7 +235,6 @@ impl B2BuaEngine {
         }
     }
 
-    // Parametre güncellendi: target_addr eklendi
     async fn play_welcome_announcement(&self, rtp_port: u32, _call_id: &str, target_addr: String) {
         let mut clients = self.clients.lock().await;
         
@@ -229,7 +243,7 @@ impl B2BuaEngine {
         let req = Request::new(PlayAudioRequest {
             audio_uri: format!("file://{}", audio_path),
             server_rtp_port: rtp_port,
-            rtp_target_addr: target_addr, // Artık gerçek hedefi gönderiyoruz
+            rtp_target_addr: target_addr,
         });
         
         match clients.media.play_audio(req).await {
@@ -267,9 +281,5 @@ impl B2BuaEngine {
             }
         }
         resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
-    }
-    
-    pub async fn initiate_call(&self, _call_id: String, _from: String, _to: String) -> anyhow::Result<()> {
-        Ok(())
     }
 }
