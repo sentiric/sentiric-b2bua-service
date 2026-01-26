@@ -195,15 +195,20 @@ impl B2BuaEngine {
 
     async fn play_welcome_announcement(&self, rtp_port: u32, _call_id: &str) {
         let mut clients = self.clients.lock().await;
-        // Varsayılan olarak welcome.wav çalar
+        
+        // DÜZELTME: "welcome.wav" yerine, sistemde kesin olarak bulunan
+        // "audio/tr/system/connecting.wav" dosyasını kullanıyoruz.
+        // Bu dosya altyapı kurulumunda oluşturulan SQL ile tanımlıdır.
+        let audio_path = "audio/tr/system/connecting.wav"; 
+        
         let req = Request::new(PlayAudioRequest {
-            audio_uri: "file://welcome.wav".to_string(),
+            audio_uri: format!("file://{}", audio_path),
             server_rtp_port: rtp_port,
             rtp_target_addr: "0.0.0.0:0".to_string(), // Media Service Latching yapacağı için dummy IP
         });
         
         match clients.media.play_audio(req).await {
-            Ok(_) => info!("🎵 [MEDIA] Welcome announcement started."),
+            Ok(_) => info!("🎵 [MEDIA] Announcement started: {}", audio_path),
             Err(e) => error!("❌ [MEDIA] Failed to play announcement: {}", e),
         }
     }
@@ -240,9 +245,8 @@ impl B2BuaEngine {
         resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
     }
     
-    // GRPC Service üzerinden çağrılan metotlar (Şimdilik unused, ileride outbound için)
+    // GRPC Service üzerinden çağrılan metotlar
     pub async fn initiate_call(&self, _call_id: String, _from: String, _to: String) -> anyhow::Result<()> {
-        // Outbound logic here
         Ok(())
     }
 }
