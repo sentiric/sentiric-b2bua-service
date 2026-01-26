@@ -123,11 +123,13 @@ impl B2BuaEngine {
             }
         };
 
-        // [FIX] Suffix Kaldırıldı: Agent Service ile uyumluluk için saf call_id kullanılıyor.
+        // [FIX] ID MATCHING:
+        // A bacağı için port alırken artık '_A' soneki EKLEMİYORUZ.
+        // Böylece Agent Service 'call_id' ile geldiğinde Media Service'te doğru portu bulabilecek.
         let port_a = {
             let mut clients = self.clients.lock().await;
             match clients.media.allocate_port(Request::new(AllocatePortRequest {
-                call_id: call_id.clone(), // "_A" YOK!
+                call_id: call_id.clone(), // DÜZELTİLDİ: format!("{}_A", call_id) yerine call_id
             })).await {
                 Ok(res) => res.into_inner().rtp_port,
                 Err(e) => {
@@ -152,6 +154,10 @@ impl B2BuaEngine {
             self.calls.insert(call_id.clone(), session);
             self.send_response(&packet, 180, "Ringing", None, src_addr).await;
             let outbound_call_id = format!("{}_B_LEG", call_id);
+            // B bacağı için port allocation burada yapılmıyor,
+            // (gerçek bir bridge senaryosunda B bacağı için de port alınması gerekirdi,
+            // şimdilik basitlik için aynı portu veya yeni portu kullanabiliriz,
+            // ancak mevcut 'initiate_outbound_leg' metoduna RTP portunu parametre olarak veriyoruz)
             self.initiate_outbound_leg(outbound_call_id, from, target_aor, target_contact, port_a, call_id).await;
         } else {
             info!("Target NOT found in Registrar. Treating as SYSTEM/AI call.");
@@ -169,6 +175,7 @@ impl B2BuaEngine {
             };
             self.calls.insert(call_id.clone(), session);
 
+            // Agent'a gönderilecek olay
             let event = CallStartedEvent {
                 event_type: "call.started".to_string(),
                 trace_id: call_id.clone(), call_id: call_id.clone(),
@@ -267,6 +274,12 @@ impl B2BuaEngine {
         }
         resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
         
+        // [FIX] Contact Header EKLENDİ
+        // Bu başlık olmadan karşı taraf ACK göndermez.
+        // User part gerekmez (SBC modunda), sadece IP:Port yeterli.
+        let contact_val = format!("<sip:{}:{}>", self.config.public_ip, self.config.sip_port);
+        resp.headers.push(Header::new(HeaderName::Contact, contact_val));
+
         if let Some(b) = body {
             resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
             resp.body = b.as_bytes().to_vec();
