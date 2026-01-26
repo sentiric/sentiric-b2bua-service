@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, error, debug}; // 'warn' kaldırıldı (kullanılmıyorsa)
+use tracing::{info, error, debug, warn};
 use sentiric_sip_core::{SipPacket, Method, HeaderName, Header, utils as sip_utils};
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, PlayAudioRequest, ReleasePortRequest};
 use tonic::Request;
@@ -11,15 +11,13 @@ use crate::config::AppConfig;
 use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use std::net::{SocketAddr, IpAddr};
-// 'uuid' importu kaldırıldı (kullanılmıyorsa)
+use serde_json::json;
 
 pub struct B2BuaEngine {
     config: Arc<AppConfig>,
     clients: Arc<Mutex<InternalClients>>,
     calls: CallStore,
     transport: Arc<sentiric_sip_core::SipTransport>,
-    // rabbitmq şimdilik kullanılmıyor uyarısı veriyorsa başına _ koyabiliriz veya ileride kullanacağız
-    #[allow(dead_code)]
     rabbitmq: Arc<RabbitMqClient>,
 }
 
@@ -58,7 +56,6 @@ impl B2BuaEngine {
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
         // 1. Retransmission Kontrolü
-        // DÜZELTME: 'mut session' uyarısı için 'mut' kaldırıldı, DashMap zaten içsel mutability sağlar
         if let Some(session) = self.calls.get(&call_id) {
             if let Some(last_resp) = &session.last_response_packet {
                 info!("🔄 [SIP] Retransmission detected for {}, resending 200 OK.", call_id);
@@ -149,6 +146,9 @@ impl B2BuaEngine {
             error!("Failed to send 200 OK: {}", e);
         } else {
             info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
+            
+            // 6. EVENT PUBLISHING (CRITICAL STEP)
+            self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
         }
 
         self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
@@ -172,10 +172,59 @@ impl B2BuaEngine {
 
         if let Some((_, session)) = self.calls.remove(&call_id) {
             self.release_media_port(session.rtp_port).await;
+            
+            // EVENT PUBLISHING
+            self.publish_call_ended(&call_id).await;
         }
     }
 
     // --- Helpers ---
+
+    async fn publish_call_started(&self, call_id: &str, server_port: u32, caller_rtp: &str, from: &str, to: &str) {
+        let payload = json!({
+            "eventType": "call.started",
+            "callId": call_id,
+            "participants": {
+                "from": from,
+                "to": to
+            },
+            "mediaInfo": {
+                "serverRtpPort": server_port,
+                "callerRtpAddr": caller_rtp
+            },
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+
+        match serde_json::to_vec(&payload) {
+            Ok(body) => {
+                if let Err(e) = self.rabbitmq.publish_event_bytes("call.started", &body).await {
+                    error!("❌ [MQ] Failed to publish call.started: {}", e);
+                } else {
+                    info!("📨 [MQ] Published call.started for {}", call_id);
+                }
+            }
+            Err(e) => error!("Failed to serialize call.started event: {}", e),
+        }
+    }
+
+    async fn publish_call_ended(&self, call_id: &str) {
+        let payload = json!({
+            "eventType": "call.ended",
+            "callId": call_id,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+
+        match serde_json::to_vec(&payload) {
+            Ok(body) => {
+                if let Err(e) = self.rabbitmq.publish_event_bytes("call.ended", &body).await {
+                    error!("❌ [MQ] Failed to publish call.ended: {}", e);
+                } else {
+                    info!("📨 [MQ] Published call.ended for {}", call_id);
+                }
+            }
+            Err(e) => error!("Failed to serialize call.ended event: {}", e),
+        }
+    }
 
     fn extract_sdp_info(&self, body: &[u8]) -> Option<(IpAddr, u16)> {
         let sdp_str = std::str::from_utf8(body).ok()?;
@@ -270,11 +319,9 @@ impl B2BuaEngine {
         resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
     }
     
-    // --- DÜZELTME: Bu metot gRPC servisi tarafından çağrılıyor ve EKSİKTİ ---
     pub async fn initiate_call(&self, call_id: String, from: String, to: String) -> anyhow::Result<()> {
         info!("🚀 [OUTBOUND] Call initiation requested. ID: {}, From: {}, To: {}", call_id, from, to);
         // Gelecekte burada outbound call mantığı (Proxy'ye INVITE gönderme) olacak.
-        // Şimdilik sadece logluyoruz, çünkü mevcut focus Inbound (Gelen) çağrılar.
         Ok(())
     }
 }
