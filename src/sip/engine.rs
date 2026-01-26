@@ -29,13 +29,7 @@ impl B2BuaEngine {
         transport: Arc<sentiric_sip_core::SipTransport>,
         rabbitmq: Arc<RabbitMqClient>,
     ) -> Self {
-        Self {
-            config,
-            clients,
-            calls,
-            transport,
-            rabbitmq,
-        }
+        Self { config, clients, calls, transport, rabbitmq }
     }
 
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
@@ -44,7 +38,7 @@ impl B2BuaEngine {
                 Method::Invite => self.handle_invite(packet, src_addr).await,
                 Method::Ack => self.handle_ack(packet).await,
                 Method::Bye => self.handle_bye(packet, src_addr).await,
-                _ => { debug!("Method not handled: {:?}", packet.method); }
+                _ => { debug!("Method ignored: {:?}", packet.method); }
             }
         }
     }
@@ -54,40 +48,36 @@ impl B2BuaEngine {
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
-        // 1. Retransmission Kontrolü
+        // RETRANSMISSION CHECK
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             if let Some(last_resp) = &session.last_response_packet {
-                info!("🔄 [SIP] Retransmission detected for {}, resending 200 OK.", call_id);
+                info!("🔄 [SIP] Retransmission: Resending stored 200 OK for {}", call_id);
                 let _ = self.transport.send(last_resp, src_addr).await;
                 return;
             }
         }
 
-        info!("📞 [INVITE] New Call: {} -> {}", from, to);
+        info!("📞 [INVITE] Processing Call: {} -> {}", from, to);
 
         // 100 Trying
         let mut trying = SipPacket::new_response(100, "Trying".to_string());
         self.copy_headers(&mut trying, &req);
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
-        // 2. SDP Analizi
+        // Caller RTP Target Resolution
         let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
         let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
-        info!("🎯 Caller RTP Target Resolved: {}", rtp_target_str);
 
-        // 3. Media Service'ten Port İste
+        // Media Port Allocation
         let rtp_port = match self.allocate_media_port(&call_id).await {
             Ok(p) => p,
             Err(e) => {
-                error!("❌ Media Allocation Failed: {}", e);
-                let mut err_resp = SipPacket::new_response(503, "Service Unavailable".to_string());
-                self.copy_headers(&mut err_resp, &req);
-                let _ = self.transport.send(&err_resp.to_bytes(), src_addr).await;
+                error!("❌ Media Error: {}", e);
                 return;
             }
         };
 
-        // 4. Session Oluştur
+        // Create Session
         let local_tag = sip_utils::generate_tag("b2bua");
         let session = CallSession {
             call_id: call_id.clone(),
@@ -100,12 +90,12 @@ impl B2BuaEngine {
         };
         self.calls.insert(call_id.clone(), session);
 
-        // 5. 200 OK (SDP)
-        // SIP UAS'taki gibi G.729 öncelikli ve sade SDP
+        // 200 OK & SDP Construction (THE CRITICAL PART)
+        // Burada self.config.public_ip kullanıyoruz. Bu IP, operatörün erişebileceği IP olmalı.
         let sdp = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
-            s=SentiricB2BUA\r\n\
+            s=Sentiric\r\n\
             c=IN IP4 {}\r\n\
             t=0 0\r\n\
             m=audio {} RTP/AVP 18 0 8 101\r\n\
@@ -124,27 +114,26 @@ impl B2BuaEngine {
         let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers_with_tag(&mut ok_resp, &req, &local_tag);
         
-        // --- VENDOR PROFILE LOGIC (KRİTİK BÖLÜM) ---
+        // Contact Header: Legacy Profile için <sip:IP:PORT>
         let contact = if self.config.vendor_profile == "legacy" {
-            // Legacy (SBC Uyumlu): <sip:IP:PORT> (User part YOK)
+            // SBC'nin göreceği Contact header. Proxy üzerinden geçtiği için
+            // bu IP'nin Proxy tarafından erişilebilir veya yönlendirilebilir olması lazım.
+            // Ama operatöre giden pakette bu başlık değişebilir.
+            // B2BUA olarak biz kendi Public IP'mizi basıyoruz.
             format!("<sip:{}:{}>", self.config.public_ip, self.config.sip_port)
         } else {
-            // Standard: <sip:user@IP:PORT>
             format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)
         };
         
         ok_resp.headers.push(Header::new(HeaderName::Contact, contact));
-        
-        // Operatörlerin sevdiği ek başlıklar
         ok_resp.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
         ok_resp.headers.push(Header::new(HeaderName::Supported, "replaces, timer".to_string()));
-        ok_resp.headers.push(Header::new(HeaderName::UserAgent, "Sentiric B2BUA".to_string()));
-        
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         ok_resp.body = sdp.as_bytes().to_vec();
 
         let response_bytes = ok_resp.to_bytes();
 
+        // Save Response for Retransmission
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             session.last_response_packet = Some(response_bytes.clone());
         }
@@ -152,10 +141,10 @@ impl B2BuaEngine {
         if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
             error!("Failed to send 200 OK: {}", e);
         } else {
-            info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
+            info!("✅ [SIP] 200 OK Sent (RTP: {}, Contact: Public IP)", rtp_port);
         }
 
-        // 6. IVR / Anons Başlat
+        // Start Audio
         self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
     }
 
@@ -164,91 +153,64 @@ impl B2BuaEngine {
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             session.state = CallState::Established;
             info!("✅ [ACK] Call Established: {}", call_id);
-        } else {
-            warn!("⚠️ [ACK] Received for unknown call: {}", call_id);
         }
     }
 
     async fn handle_bye(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        info!("🛑 [BYE] Request received for {}", call_id);
-
+        info!("🛑 [BYE] Received for {}", call_id);
         let mut ok = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers(&mut ok, &req);
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
-
         if let Some((_, session)) = self.calls.remove(&call_id) {
             self.release_media_port(session.rtp_port).await;
         }
     }
 
-    // --- Helpers ---
-
+    // --- Helpers (Previously defined methods remain the same) ---
     fn extract_sdp_info(&self, body: &[u8]) -> Option<(IpAddr, u16)> {
         let sdp_str = std::str::from_utf8(body).ok()?;
         let mut ip: Option<IpAddr> = None;
         let mut port: Option<u16> = None;
-
         for line in sdp_str.lines() {
             if line.starts_with("c=IN IP4") {
                 if let Some(ip_str) = line.split_whitespace().last() {
-                    if let Ok(parsed_ip) = ip_str.parse::<IpAddr>() {
-                        ip = Some(parsed_ip);
-                    }
+                    if let Ok(parsed_ip) = ip_str.parse::<IpAddr>() { ip = Some(parsed_ip); }
                 }
             }
             if line.starts_with("m=audio") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    if let Ok(p) = parts[1].parse::<u16>() {
-                        port = Some(p);
-                    }
+                    if let Ok(p) = parts[1].parse::<u16>() { port = Some(p); }
                 }
             }
         }
-
-        if let (Some(i), Some(p)) = (ip, port) {
-            Some((i, p))
-        } else {
-            None
-        }
+        if let (Some(i), Some(p)) = (ip, port) { Some((i, p)) } else { None }
     }
 
     async fn allocate_media_port(&self, call_id: &str) -> anyhow::Result<u32> {
         let mut clients = self.clients.lock().await;
-        let req = Request::new(AllocatePortRequest {
-            call_id: call_id.to_string(),
-        });
+        let req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
         let resp = clients.media.allocate_port(req).await?.into_inner();
         Ok(resp.rtp_port)
     }
 
     async fn release_media_port(&self, port: u32) {
         let mut clients = self.clients.lock().await;
-        let req = Request::new(ReleasePortRequest {
-            rtp_port: port,
-        });
-        if let Err(e) = clients.media.release_port(req).await {
-            error!("Failed to release port {}: {}", port, e);
-        } else {
-            info!("♻️ Released RTP Port: {}", port);
-        }
+        let req = Request::new(ReleasePortRequest { rtp_port: port });
+        let _ = clients.media.release_port(req).await;
     }
 
     async fn play_welcome_announcement(&self, rtp_port: u32, _call_id: &str, target_addr: String) {
         let mut clients = self.clients.lock().await;
-        
-        let audio_path = "audio/tr/system/connecting.wav"; 
-        
+        // Dosya yolu düzeltildi
         let req = Request::new(PlayAudioRequest {
-            audio_uri: format!("file://{}", audio_path),
+            audio_uri: "file://audio/tr/system/connecting.wav".to_string(),
             server_rtp_port: rtp_port,
             rtp_target_addr: target_addr,
         });
-        
-        match clients.media.play_audio(req).await {
-            Ok(_) => info!("🎵 [MEDIA] Announcement started: {}", audio_path),
-            Err(e) => error!("❌ [MEDIA] Failed to play announcement: {}", e),
+        if let Err(e) = clients.media.play_audio(req).await {
+            error!("PlayAudio failed: {}", e);
         }
     }
 

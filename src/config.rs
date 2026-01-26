@@ -19,11 +19,11 @@ pub struct AppConfig {
     pub rabbitmq_url: String,
     
     pub proxy_sip_addr: String,
+    
+    // KRİTİK: Dış dünyaya bildirilecek IP (SDP ve Contact için)
     pub public_ip: String, 
     
-    // --- YENİ: Vendor Profile ---
     pub vendor_profile: String,
-    
     pub env: String,
     pub rust_log: String,
     pub service_version: String,
@@ -47,11 +47,17 @@ impl AppConfig {
         let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
             .unwrap_or_else(|_| "proxy-service:13074".to_string());
 
+        // KRİTİK DÜZELTME: Public IP okunamazsa panic vermeli veya varsayılan güvenli bir IP olmalı.
+        // Docker içindeki NODE_IP veya PUBLIC_IP buraya map edilmelidir.
+        let public_ip = env::var("B2BUA_SERVICE_PUBLIC_IP")
+            .or_else(|_| env::var("NODE_IP")) // Fallback to Node IP (Tailscale)
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+
         Ok(AppConfig {
             grpc_listen_addr: grpc_addr,
             http_listen_addr: http_addr, 
 
-            sip_bind_ip: "0.0.0.0".to_string(),
+            sip_bind_ip: "0.0.0.0".to_string(), // Dinlerken her yerden dinle
             sip_port,
             proxy_sip_addr: proxy_target,
 
@@ -60,9 +66,8 @@ impl AppConfig {
             registrar_service_url: env::var("REGISTRAR_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: REGISTRAR_SERVICE_TARGET_GRPC_URL")?,
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             
-            public_ip: env::var("B2BUA_SERVICE_PUBLIC_IP").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            public_ip, // Artık doğru IP'yi taşıyor
             
-            // YENİ: Varsayılan olarak 'legacy' yapıyoruz ki uyumluluk artsın
             vendor_profile: env::var("VENDOR_PROFILE").unwrap_or_else(|_| "legacy".to_string()),
 
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
