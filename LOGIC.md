@@ -1,39 +1,39 @@
-# 🔄 Sentiric B2BUA Service - Mantık ve Akış Mimarisi
+# 🔄 Sentiric B2BUA Service - Mantık Mimarisi (Final)
 
-**Stratejik Rol:** AI'ın tetiklediği SIP çağrı başlatma ve aktarım işlemlerini yöneten çekirdek aracı.
+**Rol:** Hat Operatörü. Medya sonlandırma ve Olay tetikleme noktası.
 
----
+## 1. Çağrı Karşılama Akışı (Inbound Handler)
 
-## 1. Dış Çağrı Başlatma (InitiateCall) Akışı
+1.  **INVITE Gelir:**
+    *   `100 Trying` gönder.
+    *   `media-service`'ten port kirala (`AllocatePort`).
 
-```mermaid
-sequenceDiagram
-    participant Agent as Agent Service
-    participant B2BUA as B2BUA Service
-    participant Registrar as Registrar Service
-    participant Media as Media Service
-    participant Proxy as SIP Proxy Service
-    participant External as External SIP Endpoint
+2.  **Medya Hazırlığı (Hole Punching):**
+    *   Arayanın SDP'sindeki IP'yi al.
+    *   `media-service`'e "Bu IP'ye boş paket at" (NAT Delme) emrini ver.
 
-    Agent->>B2BUA: InitiateCall(from_uri, to_uri)
-    
-    Note over B2BUA: Arayan (A) bacağı için medya kurar.
-    B2BUA->>Media: AllocatePort(call_id_A)
-    Media-->>B2BUA: RTP_Port_A
-    
-    Note over B2BUA: Aranan (B) bacağını başlatır.
-    B2BUA->>Registrar: LookupContact(to_uri)
-    Registrar-->>B2BUA: Contact_URI (External IP:Port)
-    
-    B2BUA->>Proxy: SendInvite(to_uri, Contact_URI, SDP with RTP_Port_A)
-    Proxy-->>External: INVITE
-    External-->>Proxy: 200 OK (SDP with RTP_Port_B)
-    Proxy-->>B2BUA: 200 OK (SDP)
+3.  **Cevaplama:**
+    *   `200 OK` gönder (SDP içinde Public IP ile).
+    *   **KRİTİK ADIM:** `RabbitMQ`'ya `call.started` olayını bas. (İçinde CallID, Arayan, Aranan bilgisi ile).
 
-    Note over B2BUA: Medyayı birbirine bağlar ve ACK gönderir.
-    B2BUA->>Media: ConnectPorts(RTP_Port_A, RTP_Port_B)
-    B2BUA->>Proxy: SendAck(...)
-    
-    B2BUA-->>Agent: InitiateCallResponse(success: true, new_call_id)
+4.  **Yaşam Döngüsü:**
+    *   Çağrı sürdüğü sürece (SIP Session) hattı açık tut.
+    *   `BYE` gelirse `media-service`'teki portu serbest bırak ve `call.ended` olayını bas.
+
+## 2. Olay Şeması (RabbitMQ Payload)
+
+B2BUA'nın attığı topu `agent-service` karşılar.
+
+```json
+{
+  "eventType": "call.started",
+  "callId": "...",
+  "mediaInfo": {
+    "serverRtpPort": 10050,
+    "callerRtpAddr": "1.2.3.4:5678"
+  },
+  "dialplanResolution": { ... }
+}
 ```
 
+---
