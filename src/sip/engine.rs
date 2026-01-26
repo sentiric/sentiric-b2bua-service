@@ -61,7 +61,6 @@ impl B2BuaEngine {
             })).await {
                 Ok(res) => {
                     let uris = res.into_inner().contact_uris;
-                    // DÜZELTME: is_empty -> is_empty()
                     if uris.is_empty() {
                         return Err(anyhow::anyhow!("Hedef kullanıcı kayıtlı değil: {}", to_uri));
                     }
@@ -124,10 +123,13 @@ impl B2BuaEngine {
             }
         };
 
+        // [FIX] ID MATCHING:
+        // A bacağı için port alırken artık '_A' soneki EKLEMİYORUZ.
+        // Böylece Agent Service 'call_id' ile geldiğinde Media Service'te doğru portu bulabilecek.
         let port_a = {
             let mut clients = self.clients.lock().await;
             match clients.media.allocate_port(Request::new(AllocatePortRequest {
-                call_id: format!("{}_A", call_id),
+                call_id: call_id.clone(), // DÜZELTİLDİ: format!("{}_A", call_id) yerine call_id
             })).await {
                 Ok(res) => res.into_inner().rtp_port,
                 Err(e) => {
@@ -141,7 +143,7 @@ impl B2BuaEngine {
         if let Some(target_contact) = contact_uri {
             info!("Target is a User. Bridging to {}", target_contact);
             let session = CallSession {
-                call_id: call_id.clone(), // DÜZELTME: Eksik alan eklendi
+                call_id: call_id.clone(),
                 state: CallState::Trying,
                 from_uri: from.clone(), to_uri: to.clone(),
                 rtp_port: port_a, remote_tag: None,
@@ -152,6 +154,10 @@ impl B2BuaEngine {
             self.calls.insert(call_id.clone(), session);
             self.send_response(&packet, 180, "Ringing", None, src_addr).await;
             let outbound_call_id = format!("{}_B_LEG", call_id);
+            // B bacağı için port allocation burada yapılmıyor,
+            // (gerçek bir bridge senaryosunda B bacağı için de port alınması gerekirdi,
+            // şimdilik basitlik için aynı portu veya yeni portu kullanabiliriz,
+            // ancak mevcut 'initiate_outbound_leg' metoduna RTP portunu parametre olarak veriyoruz)
             self.initiate_outbound_leg(outbound_call_id, from, target_aor, target_contact, port_a, call_id).await;
         } else {
             info!("Target NOT found in Registrar. Treating as SYSTEM/AI call.");
@@ -159,7 +165,7 @@ impl B2BuaEngine {
             self.send_response(&packet, 200, "OK", Some(sdp.clone()), src_addr).await;
             
             let session = CallSession {
-                call_id: call_id.clone(), // DÜZELTME: Eksik alan eklendi
+                call_id: call_id.clone(),
                 state: CallState::Established,
                 from_uri: from.clone(), to_uri: to.clone(),
                 rtp_port: port_a, remote_tag: None,
@@ -169,6 +175,7 @@ impl B2BuaEngine {
             };
             self.calls.insert(call_id.clone(), session);
 
+            // Agent'a gönderilecek olay
             let event = CallStartedEvent {
                 event_type: "call.started".to_string(),
                 trace_id: call_id.clone(), call_id: call_id.clone(),
@@ -215,7 +222,7 @@ impl B2BuaEngine {
         invite.body = sdp.as_bytes().to_vec();
 
         self.calls.insert(call_id.clone(), CallSession {
-            call_id: call_id.clone(), // DÜZELTME: Eksik alan eklendi
+            call_id: call_id.clone(),
             state: CallState::Trying,
             from_uri: from_header,
             to_uri: to_aor,
