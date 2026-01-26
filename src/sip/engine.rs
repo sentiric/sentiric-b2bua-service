@@ -10,7 +10,7 @@ use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
 use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr}; // IpAddr eklendi
 use uuid::Uuid;
 
 pub struct B2BuaEngine {
@@ -38,31 +38,23 @@ impl B2BuaEngine {
         }
     }
 
-    /// Gelen SIP paketlerini işler.
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         if packet.is_request {
             match packet.method {
                 Method::Invite => self.handle_invite(packet, src_addr).await,
                 Method::Ack => self.handle_ack(packet).await,
                 Method::Bye => self.handle_bye(packet, src_addr).await,
-                _ => {
-                    debug!("Method not handled: {:?}", packet.method);
-                }
+                _ => { debug!("Method not handled: {:?}", packet.method); }
             }
-        } else {
-            // Response handling (İleride Outbound aramalar için burası kullanılacak)
-            debug!("Response ignored in this phase.");
         }
     }
 
-    /// INVITE İşleme (Çağrı Karşılama - IVR/Echo)
     async fn handle_invite(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
-        // 1. Retransmission Kontrolü (GOLDEN RULE)
-        // Eğer bu çağrı için zaten bir session varsa ve cevap üretildiyse, aynısını gönder.
+        // 1. Retransmission Kontrolü
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             if let Some(last_resp) = &session.last_response_packet {
                 info!("🔄 [SIP] Retransmission detected for {}, resending 200 OK.", call_id);
@@ -73,10 +65,16 @@ impl B2BuaEngine {
 
         info!("📞 [INVITE] New Call: {} -> {}", from, to);
 
-        // 2. 100 Trying Gönder
+        // 100 Trying
         let mut trying = SipPacket::new_response(100, "Trying".to_string());
         self.copy_headers(&mut trying, &req);
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
+
+        // 2. SDP Analizi (Caller RTP IP/Port Çözümleme)
+        // Eğer SDP'den IP çözemezsek, kaynak IP'yi (src_addr) varsayarız.
+        let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
+        let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
+        info!("🎯 Caller RTP Target Resolved: {}", rtp_target_str);
 
         // 3. Media Service'ten Port İste
         let rtp_port = match self.allocate_media_port(&call_id).await {
@@ -103,8 +101,7 @@ impl B2BuaEngine {
         };
         self.calls.insert(call_id.clone(), session);
 
-        // 5. 200 OK (SDP) Oluştur
-        // Not: Burada 'public_ip' config'den geliyor.
+        // 5. 200 OK (SDP)
         let sdp = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
@@ -124,8 +121,6 @@ impl B2BuaEngine {
 
         let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers_with_tag(&mut ok_resp, &req, &local_tag);
-        
-        // Contact Header (Public IP ile)
         let contact = format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port);
         ok_resp.headers.push(Header::new(HeaderName::Contact, contact));
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
@@ -133,7 +128,6 @@ impl B2BuaEngine {
 
         let response_bytes = ok_resp.to_bytes();
 
-        // 6. Response'u Cache'le ve Gönder
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             session.last_response_packet = Some(response_bytes.clone());
         }
@@ -144,8 +138,9 @@ impl B2BuaEngine {
             info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
         }
 
-        // 7. IVR / Anons Başlat (Auto-Play Welcome)
-        self.play_welcome_announcement(rtp_port, &call_id).await;
+        // 6. IVR / Anons Başlat (Doğru Hedef Adres ile)
+        // Artık rtp_target_str (Gerçek IP) kullanıyoruz, 0.0.0.0 değil.
+        self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
     }
 
     async fn handle_ack(&self, req: SipPacket) {
@@ -165,12 +160,44 @@ impl B2BuaEngine {
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
 
         if let Some((_, session)) = self.calls.remove(&call_id) {
-            // Portu serbest bırak
             self.release_media_port(session.rtp_port).await;
         }
     }
 
     // --- Helpers ---
+
+    /// SDP Body içinden karşı tarafın IP ve Port bilgisini çıkarır.
+    fn extract_sdp_info(&self, body: &[u8]) -> Option<(IpAddr, u16)> {
+        let sdp_str = std::str::from_utf8(body).ok()?;
+        let mut ip: Option<IpAddr> = None;
+        let mut port: Option<u16> = None;
+
+        for line in sdp_str.lines() {
+            // c=IN IP4 192.168.1.1
+            if line.starts_with("c=IN IP4") {
+                if let Some(ip_str) = line.split_whitespace().last() {
+                    if let Ok(parsed_ip) = ip_str.parse::<IpAddr>() {
+                        ip = Some(parsed_ip);
+                    }
+                }
+            }
+            // m=audio 12345 RTP/AVP ...
+            if line.starts_with("m=audio") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(p) = parts[1].parse::<u16>() {
+                        port = Some(p);
+                    }
+                }
+            }
+        }
+
+        if let (Some(i), Some(p)) = (ip, port) {
+            Some((i, p))
+        } else {
+            None
+        }
+    }
 
     async fn allocate_media_port(&self, call_id: &str) -> anyhow::Result<u32> {
         let mut clients = self.clients.lock().await;
@@ -193,18 +220,16 @@ impl B2BuaEngine {
         }
     }
 
-    async fn play_welcome_announcement(&self, rtp_port: u32, _call_id: &str) {
+    // Parametre güncellendi: target_addr eklendi
+    async fn play_welcome_announcement(&self, rtp_port: u32, _call_id: &str, target_addr: String) {
         let mut clients = self.clients.lock().await;
         
-        // DÜZELTME: "welcome.wav" yerine, sistemde kesin olarak bulunan
-        // "audio/tr/system/connecting.wav" dosyasını kullanıyoruz.
-        // Bu dosya altyapı kurulumunda oluşturulan SQL ile tanımlıdır.
         let audio_path = "audio/tr/system/connecting.wav"; 
         
         let req = Request::new(PlayAudioRequest {
             audio_uri: format!("file://{}", audio_path),
             server_rtp_port: rtp_port,
-            rtp_target_addr: "0.0.0.0:0".to_string(), // Media Service Latching yapacağı için dummy IP
+            rtp_target_addr: target_addr, // Artık gerçek hedefi gönderiyoruz
         });
         
         match clients.media.play_audio(req).await {
@@ -232,7 +257,6 @@ impl B2BuaEngine {
                     resp.headers.push(h.clone());
                 },
                 HeaderName::To => {
-                    // To header'ına tag ekle
                     let mut new_to = h.value.clone();
                     if !new_to.contains(";tag=") {
                         new_to.push_str(&format!(";tag={}", local_tag));
@@ -245,7 +269,6 @@ impl B2BuaEngine {
         resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
     }
     
-    // GRPC Service üzerinden çağrılan metotlar
     pub async fn initiate_call(&self, _call_id: String, _from: String, _to: String) -> anyhow::Result<()> {
         Ok(())
     }
