@@ -10,19 +10,18 @@ pub struct CallSession {
     pub state: CallState,
     pub from_uri: String,
     pub to_uri: String,
+    
+    // Medya Bilgileri (Media Service'ten gelen)
     pub rtp_port: u32,
-    pub remote_tag: Option<String>,
-    // Bridging için
-    pub peer_call_id: Option<String>,
-    pub source_addr: Option<SocketAddr>,
-    // [YENİ EKLENDİ] Retransmission için son gönderilen SDP'yi saklar.
-    pub last_sdp: Option<String>,
+    
+    // SIP Transaction State (Retransmission için kritik)
+    pub local_tag: String,
+    pub last_response_packet: Option<Vec<u8>>, // Üretilen son 200 OK paketi
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallState {
-    Trying,
-    Ringing,
+    Invited,
     Established,
     Terminated,
 }
