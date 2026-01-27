@@ -75,7 +75,7 @@ impl AppConfig {
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),
             registrar_service_url: env::var("REGISTRAR_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: REGISTRAR_SERVICE_TARGET_GRPC_URL")?,
-            user_service_url: env::var("USER_SERVICE_TARGET_GRPC_URL").unwrap_or_else(|_| "user-service:13082".to_string()),
+            user_service_url: env::var("USER_SERVICE_TARGET_GRPC_URL").unwrap_or_else(|_| "https://user-service:12011".to_string()),
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             
             public_ip, // Artık doğru IP'yi taşıyor
