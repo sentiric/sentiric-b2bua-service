@@ -6,12 +6,14 @@ use tracing::{info, error, debug, warn};
 use sentiric_sip_core::{SipPacket, Method, HeaderName, Header, utils as sip_utils};
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, PlayAudioRequest, ReleasePortRequest};
 use tonic::Request;
+use uuid; // Eklendi (TODO: Cargo.toml check) (Self-correction: Will verify)
+use prost_types;
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
 use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use std::net::{SocketAddr, IpAddr};
-use serde_json::json;
+
 
 pub struct B2BuaEngine {
     config: Arc<AppConfig>,
@@ -205,48 +207,50 @@ impl B2BuaEngine {
     // --- Helpers ---
 
     async fn publish_call_started(&self, call_id: &str, server_port: u32, caller_rtp: &str, from: &str, to: &str) {
-        let payload = json!({
-            "eventType": "call.started",
-            "callId": call_id,
-            "participants": {
-                "from": from,
-                "to": to
-            },
-            "mediaInfo": {
-                "serverRtpPort": server_port,
-                "callerRtpAddr": caller_rtp
-            },
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        });
+        use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, MediaInfo};
+        use prost::Message;
 
-        match serde_json::to_vec(&payload) {
-            Ok(body) => {
-                if let Err(e) = self.rabbitmq.publish_event_bytes("call.started", &body).await {
-                    error!("❌ [MQ] Failed to publish call.started: {}", e);
-                } else {
-                    info!("📨 [MQ] Published call.started for {}", call_id);
-                }
-            }
-            Err(e) => error!("Failed to serialize call.started event: {}", e),
+        let event = CallStartedEvent {
+            event_type: "call.started".to_string(),
+            trace_id: uuid::Uuid::new_v4().to_string(), // Basitlik için
+            call_id: call_id.to_string(),
+            from_uri: from.to_string(),
+            to_uri: to.to_string(),
+            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            dialplan_resolution: None, // Şimdilik boş
+            media_info: Some(MediaInfo {
+                caller_rtp_addr: caller_rtp.to_string(),
+                server_rtp_port: server_port,
+            }),
+        };
+
+        let body = event.encode_to_vec();
+
+        if let Err(e) = self.rabbitmq.publish_event_bytes("call.started", &body).await {
+            error!("❌ [MQ] Failed to publish call.started: {}", e);
+        } else {
+            info!("📨 [MQ] Published call.started for {}", call_id);
         }
     }
 
     async fn publish_call_ended(&self, call_id: &str) {
-        let payload = json!({
-            "eventType": "call.ended",
-            "callId": call_id,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        });
+        use sentiric_contracts::sentiric::event::v1::CallEndedEvent;
+        use prost::Message;
 
-        match serde_json::to_vec(&payload) {
-            Ok(body) => {
-                if let Err(e) = self.rabbitmq.publish_event_bytes("call.ended", &body).await {
-                    error!("❌ [MQ] Failed to publish call.ended: {}", e);
-                } else {
-                    info!("📨 [MQ] Published call.ended for {}", call_id);
-                }
-            }
-            Err(e) => error!("Failed to serialize call.ended event: {}", e),
+        let event = CallEndedEvent {
+            event_type: "call.ended".to_string(),
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            call_id: call_id.to_string(),
+            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            reason: "normal_clearing".to_string(),
+        };
+
+        let body = event.encode_to_vec();
+
+        if let Err(e) = self.rabbitmq.publish_event_bytes("call.ended", &body).await {
+            error!("❌ [MQ] Failed to publish call.ended: {}", e);
+        } else {
+            info!("📨 [MQ] Published call.ended for {}", call_id);
         }
     }
 
