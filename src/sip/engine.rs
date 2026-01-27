@@ -45,8 +45,28 @@ impl B2BuaEngine {
                 Method::Invite => self.handle_invite(packet, src_addr).await,
                 Method::Ack => self.handle_ack(packet).await,
                 Method::Bye => self.handle_bye(packet, src_addr).await,
+                Method::Other(ref m) if m == "PUBLISH" || m == "MESSAGE" => {
+                    self.handle_generic_success(packet, src_addr).await;
+                }
                 _ => { debug!("Method not handled: {:?}", packet.method); }
             }
+        }
+    }
+
+    /// Genel amaçlı 200 OK döner (PUBLISH, MESSAGE vb. için)
+    async fn handle_generic_success(&self, req: SipPacket, src_addr: SocketAddr) {
+        let method_name = req.method.to_string();
+        info!("ℹ️ [{}] Request received, sending 200 OK (Dummy)", method_name);
+        
+        let mut ok = SipPacket::new_response(200, "OK".to_string());
+        self.copy_headers(&mut ok, &req);
+        // Expires header'ı varsa ekle (özellikle REGISTER/PUBLISH için önemli olabilir ama şimdilik basit tutalım)
+        if let Some(exp) = req.get_header_value(HeaderName::Other("Expires".to_string())) {
+             ok.headers.push(Header::new(HeaderName::Other("Expires".to_string()), exp.clone()));
+        }
+        
+        if let Err(e) = self.transport.send(&ok.to_bytes(), src_addr).await {
+            error!("Failed to send 200 OK for {}: {}", method_name, e);
         }
     }
 
