@@ -47,11 +47,21 @@ impl AppConfig {
         let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
             .unwrap_or_else(|_| "proxy-service:13074".to_string());
 
-        // KRİTİK DÜZELTME: Public IP okunamazsa panic vermeli veya varsayılan güvenli bir IP olmalı.
-        // Docker içindeki NODE_IP veya PUBLIC_IP buraya map edilmelidir.
+        // ✅ KRİTİK DÜZELTME: Public IP zorunlu ve doğru formatta olmalı
         let public_ip = env::var("B2BUA_SERVICE_PUBLIC_IP")
-            .or_else(|_| env::var("NODE_IP")) // Fallback to Node IP (Tailscale)
-            .unwrap_or_else(|_| "127.0.0.1".to_string());
+            .or_else(|_| env::var("NODE_IP")) // Fallback to Node IP
+            .context("❌ FATAL: B2BUA_SERVICE_PUBLIC_IP veya NODE_IP tanımlı değil!")?;
+       
+        // IP formatını validate et
+        if public_ip.is_empty() || public_ip == "127.0.0.1" {
+            anyhow::bail!("❌ FATAL: PUBLIC_IP geçersiz (boş veya localhost): {}", public_ip);
+        }
+        
+        // IP parse edilebilir mi kontrol et
+        public_ip.parse::<std::net::IpAddr>()
+            .context(format!("❌ PUBLIC_IP geçersiz format: {}", public_ip))?;
+        
+        tracing::info!("✅ B2BUA Public IP validated: {}", public_ip);
 
         Ok(AppConfig {
             grpc_listen_addr: grpc_addr,

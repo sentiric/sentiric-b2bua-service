@@ -20,19 +20,46 @@ impl RabbitMqClient {
         })
     }
 
-    // YENİ METOT: Binary Veri Yayınlama
+    // ✅ GÜNCELLEME: Retry Mekanizmalı Binary Veri Yayınlama
     pub async fn publish_event_bytes(&self, routing_key: &str, payload: &[u8]) -> Result<()> {
-        self.channel
-            .basic_publish(
-                "sentiric_events", 
-                routing_key,
-                BasicPublishOptions::default(),
-                payload, // Direkt binary data
-                BasicProperties::default().with_delivery_mode(2), // Persistent
-            )
-            .await?;
-            
-        debug!("Binary Event yayınlandı: {} ({} bytes)", routing_key, payload.len());
-        Ok(())
+        const MAX_RETRIES: u32 = 3;
+        
+        for attempt in 0..MAX_RETRIES {
+            match self.channel
+                .basic_publish(
+                    "sentiric_events", 
+                    routing_key,
+                    BasicPublishOptions::default(),
+                    payload,
+                    BasicProperties::default().with_delivery_mode(2), // Persistent
+                )
+                .await
+            {
+                Ok(_) => {
+                    if attempt > 0 {
+                        info!("✅ [MQ] Event published after {} retries: {}", attempt, routing_key);
+                    } else {
+                        debug!("📨 [MQ] Event published: {} ({} bytes)", routing_key, payload.len());
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "❌ [MQ] Publish failed (attempt {}/{}): {}",
+                        attempt + 1,
+                        MAX_RETRIES,
+                        e
+                    );
+                    
+                    if attempt < MAX_RETRIES - 1 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                    } else {
+                        return Err(anyhow::anyhow!("RabbitMQ publish failed after {} retries", MAX_RETRIES));
+                    }
+                }
+            }
+        }
+        
+        unreachable!()
     }
 }

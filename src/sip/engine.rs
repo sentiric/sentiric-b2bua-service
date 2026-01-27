@@ -95,13 +95,15 @@ impl B2BuaEngine {
         let local_tag = sip_utils::generate_tag("b2bua");
         
         // 5. 200 OK (SDP) Hazırla
-        let sdp = format!(
+        // 5. 200 OK (SDP) Hazırla
+        // ✅ GÜNCELLEME: Standardize SDP Builder Kullanımı
+        let sdp_body = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
             s=SentiricB2BUA\r\n\
             c=IN IP4 {}\r\n\
             t=0 0\r\n\
-            m=audio {} RTP/AVP 18 0 8 101\r\n\
+            {}\r\n\
             a=rtpmap:18 G729/8000\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
             a=rtpmap:8 PCMA/8000\r\n\
@@ -111,23 +113,24 @@ impl B2BuaEngine {
             a=sendrecv\r\n",
             self.config.public_ip, 
             self.config.public_ip,
-            rtp_port
+            sentiric_sip_core::sdp::build_sdp_media_line(rtp_port as u16)
         );
 
         let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers_with_tag(&mut ok_resp, &req, &local_tag);
         
-        let contact = if self.config.vendor_profile == "legacy" {
-            format!("<sip:{}:{}>", self.config.public_ip, self.config.sip_port)
-        } else {
-            format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)
-        };
+        // ✅ GÜNCELLEME: Contact Header Builder
+        let contact_header = sentiric_sip_core::builder::build_contact_header(
+            "b2bua",
+            &self.config.public_ip,
+            self.config.sip_port
+        );
         
-        ok_resp.headers.push(Header::new(HeaderName::Contact, contact));
+        ok_resp.headers.push(contact_header);
         ok_resp.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
         ok_resp.headers.push(Header::new(HeaderName::Supported, "replaces, timer".to_string()));
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-        ok_resp.body = sdp.as_bytes().to_vec();
+        ok_resp.body = sdp_body.as_bytes().to_vec();
 
         // 6. [GÜNCELLENDİ] Session'ı Kaydet (Response Cache ile Birlikte)
         let session = CallSession {
