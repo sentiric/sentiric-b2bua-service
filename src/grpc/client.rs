@@ -11,6 +11,7 @@ use tracing::info;
 pub struct InternalClients {
     pub media: MediaServiceClient<Channel>,
     pub registrar: RegistrarServiceClient<Channel>,
+    pub user: sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClient<Channel>,
 }
 
 impl InternalClients {
@@ -19,10 +20,12 @@ impl InternalClients {
 
         let media_channel = create_secure_channel(&config.media_service_url, "media-service", config).await?;
         let registrar_channel = create_secure_channel(&config.registrar_service_url, "registrar-service", config).await?;
+        let user_channel = create_secure_channel(&config.user_service_url, "user-service", config).await?;
 
         Ok(Self {
             media: MediaServiceClient::new(media_channel),
             registrar: RegistrarServiceClient::new(registrar_channel),
+            user: sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClient::new(user_channel),
         })
     }
 }

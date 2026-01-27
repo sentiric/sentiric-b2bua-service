@@ -1,6 +1,7 @@
 // sentiric-b2bua-service/src/sip/state.rs
 
 use std::sync::Arc;
+use std::net::SocketAddr;
 use dashmap::DashMap;
 use sentiric_sip_core::SipPacket;
 
@@ -14,12 +15,13 @@ pub struct CallSession {
     // Medya Bilgileri (Media Service'ten gelen)
     pub rtp_port: u32,
     
-    // SIP Transaction State (Retransmission için kritik)
+    // SIP Transaction State
     pub local_tag: String,
+    pub caller_addr: Option<SocketAddr>,
+    pub callee_addr: Option<SocketAddr>,
+    pub is_bridged: bool,
 
     // [YENİ] Idempotency Cache: 
-    // Üretilen son 200 OK yanıtını saklarız. 
-    // Tekrar (Retransmission) gelirse bunu aynen döneriz.
     pub last_invite_response: Option<SipPacket>, 
 }
 
