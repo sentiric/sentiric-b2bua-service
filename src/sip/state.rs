@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use dashmap::DashMap;
-// use std::net::SocketAddr; // KALDIRILDI: Kullanılmıyordu
+use sentiric_sip_core::SipPacket;
 
 #[derive(Debug, Clone)]
 pub struct CallSession {
@@ -16,7 +16,11 @@ pub struct CallSession {
     
     // SIP Transaction State (Retransmission için kritik)
     pub local_tag: String,
-    pub last_response_packet: Option<Vec<u8>>, // Üretilen son 200 OK paketi
+
+    // [YENİ] Idempotency Cache: 
+    // Üretilen son 200 OK yanıtını saklarız. 
+    // Tekrar (Retransmission) gelirse bunu aynen döneriz.
+    pub last_invite_response: Option<SipPacket>, 
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -55,18 +55,21 @@ impl B2BuaEngine {
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
-        // 1. Retransmission Kontrolü
+        // 1. [KRİTİK] Retransmission (Tekrar) Kontrolü
+        // Eğer bu Call-ID için zaten bir oturum ve üretilmiş bir cevap varsa,
+        // yeni bir işlem yapma (port alma, tag üretme vb.).
+        // Sadece hafızadaki cevabı aynen (idempotent) geri gönder.
         if let Some(session) = self.calls.get(&call_id) {
-            if let Some(last_resp) = &session.last_response_packet {
-                info!("🔄 [SIP] Retransmission detected for {}, resending 200 OK.", call_id);
-                let _ = self.transport.send(last_resp, src_addr).await;
+            if let Some(last_resp) = &session.last_invite_response {
+                warn!("🔄 [SIP] Retransmission detected for {}, resending cached 200 OK.", call_id);
+                let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
                 return;
             }
         }
 
         info!("📞 [INVITE] New Call: {} -> {}", from, to);
 
-        // 100 Trying
+        // 100 Trying (Stateless, kaydetmeye gerek yok)
         let mut trying = SipPacket::new_response(100, "Trying".to_string());
         self.copy_headers(&mut trying, &req);
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
@@ -88,20 +91,10 @@ impl B2BuaEngine {
             }
         };
 
-        // 4. Session Oluştur
+        // 4. Session Oluştur (Tag Üretimi)
         let local_tag = sip_utils::generate_tag("b2bua");
-        let session = CallSession {
-            call_id: call_id.clone(),
-            state: CallState::Invited,
-            from_uri: from.clone(),
-            to_uri: to.clone(),
-            rtp_port,
-            local_tag: local_tag.clone(),
-            last_response_packet: None,
-        };
-        self.calls.insert(call_id.clone(), session);
-
-        // 5. 200 OK (SDP)
+        
+        // 5. 200 OK (SDP) Hazırla
         let sdp = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
@@ -110,10 +103,10 @@ impl B2BuaEngine {
             t=0 0\r\n\
             m=audio {} RTP/AVP 18 0 8 101\r\n\
             a=rtpmap:18 G729/8000\r\n\
-            a=fmtp:18 annexb=no\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
             a=rtpmap:8 PCMA/8000\r\n\
             a=rtpmap:101 telephone-event/8000\r\n\
+            a=fmtp:18 annexb=no\r\n\
             a=fmtp:101 0-16\r\n\
             a=sendrecv\r\n",
             self.config.public_ip, 
@@ -136,18 +129,26 @@ impl B2BuaEngine {
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         ok_resp.body = sdp.as_bytes().to_vec();
 
-        let response_bytes = ok_resp.to_bytes();
+        // 6. [GÜNCELLENDİ] Session'ı Kaydet (Response Cache ile Birlikte)
+        let session = CallSession {
+            call_id: call_id.clone(),
+            state: CallState::Invited,
+            from_uri: from.clone(),
+            to_uri: to.clone(),
+            rtp_port,
+            local_tag: local_tag.clone(),
+            last_invite_response: Some(ok_resp.clone()), // Cache'e atıyoruz!
+        };
+        self.calls.insert(call_id.clone(), session);
 
-        if let Some(mut session) = self.calls.get_mut(&call_id) {
-            session.last_response_packet = Some(response_bytes.clone());
-        }
-        
+        // 7. Yanıtı Gönder
+        let response_bytes = ok_resp.to_bytes();
         if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
             error!("Failed to send 200 OK: {}", e);
         } else {
             info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
             
-            // 6. EVENT PUBLISHING (CRITICAL STEP)
+            // Event Publishing
             self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
         }
 
