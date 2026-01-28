@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, error, debug, warn};
 use sentiric_sip_core::{SipPacket, Method, HeaderName, Header, utils as sip_utils};
-use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest};
+use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest, PlayAudioRequest};
 use tonic::Request;
 use uuid;
 use prost_types;
@@ -87,7 +87,6 @@ impl B2BuaEngine {
         }
     }
 
-    // [FIX] ATOMİK INVITE İŞLEME (Race Condition Çözümü)
     async fn handle_invite(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
@@ -112,6 +111,9 @@ impl B2BuaEngine {
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
         let local_tag = sip_utils::generate_tag("b2bua");
+        
+        // [FIX] Hedef IP/Port tespiti
+        // Eğer SDP'de IP yoksa (nadirdir), kaynak IP'yi kullanırız.
         let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
         let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
 
@@ -206,23 +208,26 @@ impl B2BuaEngine {
             last_invite_response: None,
         };
         
+        // SDP oluşturma
+        // G.729 (18), PCMU (0), PCMA (8) desteği
         let sdp_body = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
             s=SentiricB2BUA\r\n\
             c=IN IP4 {}\r\n\
             t=0 0\r\n\
-            {}\r\n\
+            m=audio {} RTP/AVP 18 0 8 101\r\n\
             a=rtpmap:18 G729/8000\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
             a=rtpmap:8 PCMA/8000\r\n\
             a=rtpmap:101 telephone-event/8000\r\n\
             a=fmtp:18 annexb=no\r\n\
             a=fmtp:101 0-16\r\n\
+            a=ptime:20\r\n\
             a=sendrecv\r\n",
             self.config.public_ip, 
             self.config.public_ip,
-            sentiric_sip_core::sdp::build_sdp_media_line(rtp_port as u16)
+            rtp_port
         );
 
         let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
@@ -239,11 +244,20 @@ impl B2BuaEngine {
         self.calls.insert(call_id.clone(), final_session);
 
         let response_bytes = ok_resp.to_bytes();
+        
+        // 1. 200 OK Gönder
         if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
             error!("Failed to send 200 OK: {}", e);
         } else {
             info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
+            
+            // 2. Olayı Yayınla
             self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
+
+            // 3. [FIX] NAT DELME & HEDEF TANITMA (Aggressive Hole Punching)
+            // Agent konuşmaya başlamadan önce, Media Service'in hedefi tanıması lazım.
+            // Bunun için kısa bir sessizlik veya "nat_warmer" gönderiyoruz.
+            self.trigger_hole_punching(rtp_port, rtp_target_str).await;
         }
     }
 
@@ -290,11 +304,8 @@ impl B2BuaEngine {
         }
     }
 
-    // [DÜZELTME] E0599 Hata Çözümü: initiate_call Metodu Eklendi
     pub async fn initiate_call(&self, call_id: String, from: String, to: String) -> anyhow::Result<()> {
         info!("🚀 [OUTBOUND] Call initiation requested. ID: {}, From: {}, To: {}", call_id, from, to);
-        // Gelecekte burada outbound call mantığı (Proxy'ye INVITE gönderme) olacak.
-        // Şimdilik sadece log atıp başarılı dönüyoruz.
         Ok(())
     }
 
@@ -362,6 +373,24 @@ impl B2BuaEngine {
         let req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
         let resp = clients.media.allocate_port(req).await?.into_inner();
         Ok(resp.rtp_port)
+    }
+
+    // [YENİ] Media Service'e "Bu IP'ye ses gönder" komutu vererek NAT'ı del.
+    async fn trigger_hole_punching(&self, rtp_port: u32, target_addr: String) {
+        let mut clients = self.clients.lock().await;
+        // Assets içinde var olan kısa bir dosya veya sessizlik
+        let audio_path = "audio/tr/system/nat_warmer.wav"; 
+        
+        let req = Request::new(PlayAudioRequest {
+            audio_uri: format!("file://{}", audio_path),
+            server_rtp_port: rtp_port,
+            rtp_target_addr: target_addr.clone(),
+        });
+        
+        info!("🔨 [B2BUA] Triggering Hole Punching -> {} on port {}", target_addr, rtp_port);
+        if let Err(e) = clients.media.play_audio(req).await {
+            warn!("⚠️ Hole punching request failed (Non-fatal, manual latching required): {}", e);
+        }
     }
 
     async fn release_media_port(&self, port: u32) {
