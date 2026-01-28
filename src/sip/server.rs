@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 use sentiric_sip_core::{SipTransport, parser};
 use crate::sip::engine::B2BuaEngine;
 
@@ -32,17 +32,22 @@ impl SipServer {
                 res = socket.recv_from(&mut buf) => {
                     match res {
                         Ok((len, src_addr)) => {
+                            // [FIX] Keep-Alive Filtresi
+                            if len < 4 || buf[..len].iter().all(|&b| b == b'\r' || b == b'\n' || b == 0) {
+                                debug!("💤 Keep-Alive ignored from {}", src_addr);
+                                continue;
+                            }
+
                             let data = &buf[..len];
                             match parser::parse(data) {
                                 Ok(packet) => {
                                     let engine = self.engine.clone();
-                                    // DÜZELTME: src_addr parametresi eklendi
                                     tokio::spawn(async move {
                                         engine.handle_packet(packet, src_addr).await;
                                     });
                                 },
                                 Err(e) => {
-                                    warn!("SIP parse hatası: {}", e);
+                                    warn!("SIP parse hatası: {} (Len: {})", e, len);
                                 }
                             }
                         },
