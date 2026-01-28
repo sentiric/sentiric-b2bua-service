@@ -310,6 +310,7 @@ impl B2BuaEngine {
         }
 
         let response_bytes = ok_resp.to_bytes();
+
         if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
             error!("Failed to send 200 OK: {}", e);
         } else {
@@ -317,8 +318,8 @@ impl B2BuaEngine {
             self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
         }
 
-        // Medya servisinin sesi hemen başlatmasını sağlamak için (Hoşgeldiniz anonsu)
-        self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
+        // [İPTAL EDİLDİ] Agent Service zaten konuşacak, burası çakışma yaratıyor.
+        // self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
     }
 
     async fn handle_ack(&self, req: SipPacket) {
