@@ -14,6 +14,46 @@ use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use std::net::{SocketAddr, IpAddr};
 
+/// SIP URI'dan (örn: "sip:2001@10.88.0.1:39861") SocketAddr çıkarır.
+/// Desteklenen formatlar:
+///   - "sip:user@ip:port" → "ip:port"
+///   - "<sip:user@ip:port;transport=udp>" → "ip:port"
+///   - "ip:port" → "ip:port"
+fn extract_socket_addr_from_uri(uri: &str) -> Option<SocketAddr> {
+    let mut s = uri.trim();
+    
+    // Açı parantezlerini temizle: <...>
+    s = s.trim_start_matches('<').trim_end_matches('>');
+    
+    // sip: veya sips: prefix'ini temizle
+    if s.starts_with("sip:") {
+        s = &s[4..];
+    } else if s.starts_with("sips:") {
+        s = &s[5..];
+    }
+    
+    // user@host:port formatından host:port kısmını al
+    let host_port_part = if let Some(at_idx) = s.find('@') {
+        &s[at_idx + 1..]
+    } else {
+        s
+    };
+    
+    // URI parametrelerini temizle: ;transport=udp, ;user=phone vb.
+    let host_port = if let Some(semi_idx) = host_port_part.find(';') {
+        &host_port_part[..semi_idx]
+    } else {
+        host_port_part
+    };
+    
+    // Port yoksa 5060 varsay
+    if !host_port.contains(':') {
+        format!("{}:5060", host_port).parse().ok()
+    } else {
+        host_port.parse().ok()
+    }
+}
+
 
 pub struct B2BuaEngine {
     config: Arc<AppConfig>,
@@ -146,7 +186,7 @@ impl B2BuaEngine {
              // 1. Kullanıcı var mı?
              let check_req = Request::new(sentiric_contracts::sentiric::user::v1::GetSipCredentialsRequest {
                  sip_username: to_user.clone(),
-                 realm: "sip.azmisahin.com".to_string(), // TODO: Domain dynamic olmalı
+                 realm: self.config.sip_realm.clone(),
              });
 
              match clients.user.get_sip_credentials(check_req).await {
@@ -155,7 +195,7 @@ impl B2BuaEngine {
                      
                      // 2. Kullanıcı Online mı? (Registrar'dan adresini sor)
                      let lookup_req = Request::new(sentiric_contracts::sentiric::sip::v1::LookupContactRequest {
-                         sip_uri: format!("sip:{}@sip.azmisahin.com", to_user),
+                         sip_uri: format!("sip:{}@{}", to_user, self.config.sip_realm),
                      });
                      
                      if let Ok(lookup_res) = clients.registrar.lookup_contact(lookup_req).await {
@@ -193,7 +233,7 @@ impl B2BuaEngine {
                  rtp_port: 0, // Bridging için medya portu yönetimini sonra ekleyelim
                  local_tag: local_tag.clone(),
                  caller_addr: Some(src_addr),
-                 callee_addr: callee_uri.parse::<SocketAddr>().ok(), // Basit parse
+                 callee_addr: extract_socket_addr_from_uri(&callee_uri), // SIP URI'dan SocketAddr çıkar
                  is_bridged: true,
                  last_invite_response: None,
              };
@@ -215,14 +255,14 @@ impl B2BuaEngine {
              invite_b.headers.retain(|h| h.name != HeaderName::Contact);
              invite_b.headers.push(b2b_contact);
 
-             if let Ok(target) = callee_uri.parse::<SocketAddr>() {
+             if let Some(target) = extract_socket_addr_from_uri(&callee_uri) {
                  if let Err(e) = self.transport.send(&invite_b.to_bytes(), target).await {
                      error!("❌ [BRIDGING] Failed to send INVITE to callee {}: {}", target, e);
                  } else {
                      info!("📤 [BRIDGING] INVITE (Leg B) sent to callee {}", target);
                  }
              } else {
-                 error!("❌ [BRIDGING] Failed to parse callee address: {}", callee_uri);
+                 error!("❌ [BRIDGING] Failed to parse callee address from URI: {}", callee_uri);
              }
 
              return; 
@@ -457,7 +497,7 @@ impl B2BuaEngine {
 
     async fn play_welcome_announcement(&self, rtp_port: u32, _call_id: &str, target_addr: String) {
         let mut clients = self.clients.lock().await;
-        let audio_path = "audio/tr/system/connecting.wav"; 
+        let audio_path = &self.config.welcome_audio_path; 
         
         let req = Request::new(PlayAudioRequest {
             audio_uri: format!("file://{}", audio_path),
