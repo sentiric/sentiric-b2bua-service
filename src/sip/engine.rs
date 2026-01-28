@@ -6,7 +6,7 @@ use tracing::{info, error, debug, warn};
 use sentiric_sip_core::{SipPacket, Method, HeaderName, Header, utils as sip_utils};
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, PlayAudioRequest, ReleasePortRequest};
 use tonic::Request;
-use uuid; // Eklendi (TODO: Cargo.toml check) (Self-correction: Will verify)
+use uuid;
 use prost_types;
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
@@ -15,10 +15,6 @@ use crate::rabbitmq::RabbitMqClient;
 use std::net::{SocketAddr, IpAddr};
 
 /// SIP URI'dan (örn: "sip:2001@10.88.0.1:39861") SocketAddr çıkarır.
-/// Desteklenen formatlar:
-///   - "sip:user@ip:port" → "ip:port"
-///   - "<sip:user@ip:port;transport=udp>" → "ip:port"
-///   - "ip:port" → "ip:port"
 fn extract_socket_addr_from_uri(uri: &str) -> Option<SocketAddr> {
     let mut s = uri.trim();
     
@@ -80,7 +76,6 @@ impl B2BuaEngine {
         }
     }
 
-    /// Gelen SIP paketlerini işler.
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         if packet.is_request {
             match packet.method {
@@ -93,27 +88,22 @@ impl B2BuaEngine {
                 _ => { debug!("Method not handled: {:?}", packet.method); }
             }
         } else {
-            // Yanıtları işle (B2B Köprüleme için)
             self.handle_response(packet, src_addr).await;
         }
     }
 
-    /// Başka bir uç noktadan gelen yanıtları işler.
     async fn handle_response(&self, mut resp: SipPacket, _src_addr: SocketAddr) {
         let call_id = resp.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         
         if let Some(session) = self.calls.get(&call_id) {
              if session.is_bridged {
-                 // BRIDGING: Response Relay (Leg B -> Leg A)
                  if let Some(caller_addr) = session.caller_addr {
                      info!("🔄 [BRIDGING] Relaying {} Response to Caller {}", resp.status_code, caller_addr);
                      
-                     // Via header'ını temizle (SBC-B2BUA arasındakini)
                      if !resp.headers.is_empty() && resp.headers[0].name == HeaderName::Via {
                          resp.headers.remove(0);
                      }
                      
-                     // Contact'ı güncelle
                      resp.headers.retain(|h| h.name != HeaderName::Contact);
                      resp.headers.push(sentiric_sip_core::builder::build_contact_header(
                          "b2bua", &self.config.public_ip, self.config.sip_port
@@ -125,14 +115,12 @@ impl B2BuaEngine {
         }
     }
 
-    /// Genel amaçlı 200 OK döner (PUBLISH, MESSAGE vb. için)
     async fn handle_generic_success(&self, req: SipPacket, src_addr: SocketAddr) {
         let method_name = req.method.to_string();
         info!("ℹ️ [{}] Request received, sending 200 OK (Dummy)", method_name);
         
         let mut ok = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers(&mut ok, &req);
-        // Expires header'ı varsa ekle (özellikle REGISTER/PUBLISH için önemli olabilir ama şimdilik basit tutalım)
         if let Some(exp) = req.get_header_value(HeaderName::Other("Expires".to_string())) {
              ok.headers.push(Header::new(HeaderName::Other("Expires".to_string()), exp.clone()));
         }
@@ -147,10 +135,6 @@ impl B2BuaEngine {
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
-        // 1. [KRİTİK] Retransmission (Tekrar) Kontrolü
-        // Eğer bu Call-ID için zaten bir oturum ve üretilmiş bir cevap varsa,
-        // yeni bir işlem yapma (port alma, tag üretme vb.).
-        // Sadece hafızadaki cevabı aynen (idempotent) geri gönder.
         if let Some(session) = self.calls.get(&call_id) {
             if let Some(last_resp) = &session.last_invite_response {
                 warn!("🔄 [SIP] Retransmission detected for {}, resending cached 200 OK.", call_id);
@@ -161,25 +145,21 @@ impl B2BuaEngine {
 
         info!("📞 [INVITE] New Call: {} -> {}", from, to);
 
-        // 100 Trying (Stateless, kaydetmeye gerek yok)
         let mut trying = SipPacket::new_response(100, "Trying".to_string());
         self.copy_headers(&mut trying, &req);
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
-        // Tag üretimi (Hem B2B hem AI için kullanılacak)
         let local_tag = sip_utils::generate_tag("b2bua");
 
-        // 2. SDP Analizi
         let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
         let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
         info!("🎯 Caller RTP Target Resolved: {}", rtp_target_str);
 
-        // --- GÜNCELLEME: Hedef Kontrolü (User vs AI) ---
+        // --- HEDEF KONTROLÜ (Bridging vs AI) ---
         let mut is_user_call = false;
         let mut callee_contact: Option<String> = None;
         let to_user = sip_utils::extract_username_from_uri(&to);
         
-        // 9999 AI için rezerve, diğerleri User olabilir
         if to_user != "9999" {
              let mut clients = self.clients.lock().await;
              
@@ -193,7 +173,9 @@ impl B2BuaEngine {
                  Ok(_) => {
                      info!("🔍 [ROUTING] Destination '{}' is a registered USER.", to_user);
                      
-                     // 2. Kullanıcı Online mı? (Registrar'dan adresini sor)
+                     // 2. Kullanıcı Online mı? (Registrar)
+                     // KRİTİK DÜZELTME: Registrar'a normalize edilmiş key gönderiyoruz
+                     // Registrar tarafındaki düzeltme ile uyumlu.
                      let lookup_req = Request::new(sentiric_contracts::sentiric::sip::v1::LookupContactRequest {
                          sip_uri: format!("sip:{}@{}", to_user, self.config.sip_realm),
                      });
@@ -223,38 +205,34 @@ impl B2BuaEngine {
              let callee_uri = callee_contact.unwrap();
              info!("🚀 [BRIDGING] Destination is a USER. Initiating Bridge for {} to {}", to_user, callee_uri);
              
-             // --- B2B BRIDGING LOGIC (ALPHA) ---
-             // 1. Session'ı B2B olarak kaydet
              let session = CallSession {
                  call_id: call_id.clone(),
                  state: CallState::Invited,
                  from_uri: from.clone(),
                  to_uri: to.clone(),
-                 rtp_port: 0, // Bridging için medya portu yönetimini sonra ekleyelim
+                 rtp_port: 0,
                  local_tag: local_tag.clone(),
                  caller_addr: Some(src_addr),
-                 callee_addr: extract_socket_addr_from_uri(&callee_uri), // SIP URI'dan SocketAddr çıkar
+                 // KRİTİK DÜZELTME: Doğru parser kullanıldı
+                 callee_addr: extract_socket_addr_from_uri(&callee_uri),
                  is_bridged: true,
                  last_invite_response: None,
              };
              self.calls.insert(call_id.clone(), session);
 
-             // 2. [KRİTİK] Yeni INVITE (Leg B) oluştur ve Callee'ye gönder
-             // Şimdilik gelen paketi clone edip hedefini değiştiriyoruz.
              let mut invite_b = req.clone();
              invite_b.uri = callee_uri.clone();
              
-             // Contact header'ını B2BUA IP'si ile güncelle
              let b2b_contact = sentiric_sip_core::builder::build_contact_header(
                  "b2bua",
                  &self.config.public_ip,
                  self.config.sip_port
              );
              
-             // Eskisini silip yenisini ekle
              invite_b.headers.retain(|h| h.name != HeaderName::Contact);
              invite_b.headers.push(b2b_contact);
 
+             // KRİTİK DÜZELTME: Doğru parser kullanıldı
              if let Some(target) = extract_socket_addr_from_uri(&callee_uri) {
                  if let Err(e) = self.transport.send(&invite_b.to_bytes(), target).await {
                      error!("❌ [BRIDGING] Failed to send INVITE to callee {}: {}", target, e);
@@ -264,11 +242,10 @@ impl B2BuaEngine {
              } else {
                  error!("❌ [BRIDGING] Failed to parse callee address from URI: {}", callee_uri);
              }
-
              return; 
         }
 
-        // 3. Media Service'ten Port İste (AI Flow)
+        // --- AI CALL FLOW ---
         let rtp_port = match self.allocate_media_port(&call_id).await {
             Ok(p) => p,
             Err(e) => {
@@ -280,7 +257,6 @@ impl B2BuaEngine {
             }
         };
 
-        // 4. Session Oluştur (AI Flow)
         let session = CallSession {
             call_id: call_id.clone(),
             state: CallState::Invited,
@@ -295,7 +271,6 @@ impl B2BuaEngine {
         };
         self.calls.insert(call_id.clone(), session);
 
-        // 5. 200 OK (SDP) Hazırla
         let sdp_body = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
@@ -330,12 +305,10 @@ impl B2BuaEngine {
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         ok_resp.body = sdp_body.as_bytes().to_vec();
 
-        // 6. Session'ı Güncelle (Response Cache)
         if let Some(mut sess) = self.calls.get_mut(&call_id) {
             sess.last_invite_response = Some(ok_resp.clone());
         }
 
-        // 7. Yanıtı Gönder
         let response_bytes = ok_resp.to_bytes();
         if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
             error!("Failed to send 200 OK: {}", e);
@@ -344,6 +317,7 @@ impl B2BuaEngine {
             self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
         }
 
+        // Medya servisinin sesi hemen başlatmasını sağlamak için (Hoşgeldiniz anonsu)
         self.play_welcome_announcement(rtp_port, &call_id, rtp_target_str).await;
     }
 
@@ -354,12 +328,10 @@ impl B2BuaEngine {
             info!("✅ [ACK] Call Established: {}", call_id);
 
             if session.is_bridged {
-                // BRIDGING: ACK'ı diğer tarafa ilet
                 let target = if session.callee_addr.is_some() { session.callee_addr } else { session.caller_addr };
                 if let Some(addr) = target {
                     info!("🔄 [BRIDGING] Relaying ACK to {}", addr);
                     let ack_b = req.clone();
-                    // Via ve Route düzenlemeleri gerekebilir ama şimdilik doğrudan gönderiyoruz.
                     let _ = self.transport.send(&ack_b.to_bytes(), addr).await;
                 }
             }
@@ -370,19 +342,16 @@ impl B2BuaEngine {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         info!("🛑 [BYE] Request received for {}", call_id);
 
-        // 200 OK yanıtını gönderen tarafa dön
         let mut ok = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers(&mut ok, &req);
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
 
         if let Some((_, session)) = self.calls.remove(&call_id) {
             if session.is_bridged {
-                // BRIDGING: BYE'ı diğer tarafa ilet
                 let target = if Some(src_addr) == session.caller_addr { session.callee_addr } else { session.caller_addr };
                 if let Some(addr) = target {
                     info!("🔄 [BRIDGING] Relaying BYE to {}", addr);
                     let mut bye_b = req.clone();
-                    // Via'yı temizle
                     if !bye_b.headers.is_empty() && bye_b.headers[0].name == HeaderName::Via {
                         bye_b.headers.remove(0);
                     }
@@ -393,8 +362,6 @@ impl B2BuaEngine {
             if session.rtp_port > 0 {
                 self.release_media_port(session.rtp_port).await;
             }
-            
-            // EVENT PUBLISHING
             self.publish_call_ended(&call_id).await;
         }
     }
@@ -407,12 +374,12 @@ impl B2BuaEngine {
 
         let event = CallStartedEvent {
             event_type: "call.started".to_string(),
-            trace_id: uuid::Uuid::new_v4().to_string(), // Basitlik için
+            trace_id: uuid::Uuid::new_v4().to_string(), 
             call_id: call_id.to_string(),
             from_uri: from.to_string(),
             to_uri: to.to_string(),
             timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
-            dialplan_resolution: None, // Şimdilik boş
+            dialplan_resolution: None, // Agent Service bunu dolduracak veya çözecek
             media_info: Some(MediaInfo {
                 caller_rtp_addr: caller_rtp.to_string(),
                 server_rtp_port: server_port,
@@ -544,7 +511,6 @@ impl B2BuaEngine {
     
     pub async fn initiate_call(&self, call_id: String, from: String, to: String) -> anyhow::Result<()> {
         info!("🚀 [OUTBOUND] Call initiation requested. ID: {}, From: {}, To: {}", call_id, from, to);
-        // Gelecekte burada outbound call mantığı (Proxy'ye INVITE gönderme) olacak.
         Ok(())
     }
 }
