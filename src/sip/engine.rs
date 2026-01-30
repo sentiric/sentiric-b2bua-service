@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, error, debug, warn};
+use tracing::{info, error, debug, warn, instrument};
 use sentiric_sip_core::{SipPacket, Method, HeaderName, Header, utils as sip_utils};
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest, PlayAudioRequest};
 use tonic::Request;
@@ -87,17 +87,17 @@ impl B2BuaEngine {
         }
     }
 
+    #[instrument(skip(self, req), fields(call_id = %req.get_header_value(HeaderName::CallId).unwrap_or(&"unknown".to_string())))]
     async fn handle_invite(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
-        let session_exists = self.calls.contains_key(&call_id);
-
-        if session_exists {
+        // 1. Retransmission Kontrolü
+        if self.calls.contains_key(&call_id) {
             if let Some(session) = self.calls.get(&call_id) {
                 if let Some(last_resp) = &session.last_invite_response {
-                    warn!("🔄 [SIP] Retransmission detected for {}, resending cached 200 OK.", call_id);
+                    warn!("🔄 [SIP] Retransmission detected for {}, resending cached response.", call_id);
                     let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
                     return;
                 }
@@ -106,21 +106,22 @@ impl B2BuaEngine {
 
         info!("📞 [INVITE] New Call Processing: {} -> {}", from, to);
 
+        // 2. 100 Trying Gönder (Hemen)
         let mut trying = SipPacket::new_response(100, "Trying".to_string());
         self.copy_headers(&mut trying, &req);
-        let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
+        if let Err(e) = self.transport.send(&trying.to_bytes(), src_addr).await {
+            error!("Failed to send 100 Trying: {}", e);
+            // Trying gönderemiyorsak muhtemelen ağ hatasıdır, devam etmeyebiliriz ama denemekte fayda var.
+        }
 
         let local_tag = sip_utils::generate_tag("b2bua");
-        
-        // [FIX] Hedef IP/Port tespiti
-        // Eğer SDP'de IP yoksa (nadirdir), kaynak IP'yi kullanırız.
         let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
         let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
 
-        // --- HEDEF KONTROLÜ (User vs AI) ---
+        // 3. Hedef Kontrolü (User vs AI)
+        let to_user = sip_utils::extract_username_from_uri(&to);
         let mut is_user_call = false;
         let mut callee_contact: Option<String> = None;
-        let to_user = sip_utils::extract_username_from_uri(&to);
         
         if to_user != "9999" {
              let mut clients = self.clients.lock().await;
@@ -153,9 +154,10 @@ impl B2BuaEngine {
              }
         }
         
+        // --- BRIDGE FLOW (User to User) ---
         if is_user_call && callee_contact.is_some() {
              let callee_uri = callee_contact.unwrap();
-             info!("🚀 [BRIDGING] Destination is a USER. Initiating Bridge for {} to {}", to_user, callee_uri);
+             info!("🚀 [BRIDGING] Initiating Bridge: {} -> {}", to_user, callee_uri);
              
              let session = CallSession {
                  call_id: call_id.clone(),
@@ -178,19 +180,26 @@ impl B2BuaEngine {
              invite_b.headers.push(b2b_contact);
 
              if let Some(target) = extract_socket_addr_from_uri(&callee_uri) {
-                 let _ = self.transport.send(&invite_b.to_bytes(), target).await;
-                 info!("📤 [BRIDGING] INVITE (Leg B) sent to callee {}", target);
+                 if let Err(e) = self.transport.send(&invite_b.to_bytes(), target).await {
+                     error!("❌ [BRIDGING] Failed to forward INVITE: {}", e);
+                     self.send_sip_error(&req, 502, "Bad Gateway", src_addr).await;
+                 } else {
+                     info!("📤 [BRIDGING] INVITE (Leg B) sent to callee {}", target);
+                 }
              } else {
                  error!("❌ [BRIDGING] Failed to parse callee address: {}", callee_uri);
+                 self.send_sip_error(&req, 500, "Address Resolution Error", src_addr).await;
              }
              return; 
         }
 
-        // --- AI FLOW ---
+        // --- AI FLOW (User to Agent) ---
+        // Port Tahsisi (Kritik Nokta)
         let rtp_port = match self.allocate_media_port(&call_id).await {
             Ok(p) => p,
             Err(e) => {
-                error!("❌ Media Allocation Failed: {}", e);
+                error!("❌ Media Allocation Failed: {}. Sending 503.", e);
+                self.send_sip_error(&req, 503, "Service Unavailable (Media)", src_addr).await;
                 return;
             }
         };
@@ -208,8 +217,6 @@ impl B2BuaEngine {
             last_invite_response: None,
         };
         
-        // SDP oluşturma
-        // G.729 (18), PCMU (0), PCMA (8) desteği
         let sdp_body = format!(
             "v=0\r\n\
             o=- 123456 123456 IN IP4 {}\r\n\
@@ -243,21 +250,26 @@ impl B2BuaEngine {
         final_session.last_invite_response = Some(ok_resp.clone());
         self.calls.insert(call_id.clone(), final_session);
 
-        let response_bytes = ok_resp.to_bytes();
-        
-        // 1. 200 OK Gönder
-        if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
+        if let Err(e) = self.transport.send(&ok_resp.to_bytes(), src_addr).await {
             error!("Failed to send 200 OK: {}", e);
+            // 200 OK gönderilemediyse portu serbest bırakmalıyız
+            self.release_media_port(rtp_port).await;
+            self.calls.remove(&call_id);
         } else {
             info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
-            
-            // 2. Olayı Yayınla
             self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
-
-            // 3. [FIX] NAT DELME & HEDEF TANITMA (Aggressive Hole Punching)
-            // Agent konuşmaya başlamadan önce, Media Service'in hedefi tanıması lazım.
-            // Bunun için kısa bir sessizlik veya "nat_warmer" gönderiyoruz.
             self.trigger_hole_punching(rtp_port, rtp_target_str).await;
+        }
+    }
+
+    // YENİ: Hata Yanıtı Gönderme Yardımcısı
+    async fn send_sip_error(&self, req: &SipPacket, code: u16, reason: &str, target: SocketAddr) {
+        let mut resp = SipPacket::new_response(code, reason.to_string());
+        self.copy_headers(&mut resp, req);
+        if let Err(e) = self.transport.send(&resp.to_bytes(), target).await {
+            error!("Failed to send error response ({} {}): {}", code, reason, e);
+        } else {
+            info!("⚠️ Sent Error Response: {} {}", code, reason);
         }
     }
 
@@ -370,15 +382,14 @@ impl B2BuaEngine {
 
     async fn allocate_media_port(&self, call_id: &str) -> anyhow::Result<u32> {
         let mut clients = self.clients.lock().await;
+        // 2 saniye timeout ile dene (Client timeout'u default 5sn)
         let req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
         let resp = clients.media.allocate_port(req).await?.into_inner();
         Ok(resp.rtp_port)
     }
 
-    // [YENİ] Media Service'e "Bu IP'ye ses gönder" komutu vererek NAT'ı del.
     async fn trigger_hole_punching(&self, rtp_port: u32, target_addr: String) {
         let mut clients = self.clients.lock().await;
-        // Assets içinde var olan kısa bir dosya veya sessizlik
         let audio_path = "audio/tr/system/nat_warmer.wav"; 
         
         let req = Request::new(PlayAudioRequest {
@@ -389,15 +400,18 @@ impl B2BuaEngine {
         
         info!("🔨 [B2BUA] Triggering Hole Punching -> {} on port {}", target_addr, rtp_port);
         if let Err(e) = clients.media.play_audio(req).await {
-            warn!("⚠️ Hole punching request failed (Non-fatal, manual latching required): {}", e);
+            warn!("⚠️ Hole punching request failed (Non-fatal): {}", e);
         }
     }
 
     async fn release_media_port(&self, port: u32) {
         let mut clients = self.clients.lock().await;
         let req = Request::new(ReleasePortRequest { rtp_port: port });
-        let _ = clients.media.release_port(req).await;
-        info!("♻️ Released RTP Port: {}", port);
+        if let Err(e) = clients.media.release_port(req).await {
+            error!("Failed to release port {}: {}", port, e);
+        } else {
+            info!("♻️ Released RTP Port: {}", port);
+        }
     }
 
     fn copy_headers(&self, resp: &mut SipPacket, req: &SipPacket) {
