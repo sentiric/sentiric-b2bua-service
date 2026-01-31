@@ -92,7 +92,7 @@ impl B2BuaEngine {
             }
         }
 
-        // REFACTOR: Core kütüphane fonksiyonu
+        // REFACTOR: Core fonksiyon
         let trying = SipPacket::create_response_for(&req, 100, "Trying".to_string());
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
@@ -138,7 +138,7 @@ impl B2BuaEngine {
     async fn handle_bye(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         
-        // REFACTOR: Core kütüphane fonksiyonu
+        // REFACTOR: Core fonksiyon
         let ok = SipPacket::create_response_for(&req, 200, "OK".to_string());
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
 
@@ -160,7 +160,6 @@ impl B2BuaEngine {
     }
     
     async fn handle_generic_success(&self, req: SipPacket, src_addr: SocketAddr) {
-        // REFACTOR: Core kütüphane fonksiyonu
         let ok = SipPacket::create_response_for(&req, 200, "OK".to_string());
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
     }
@@ -199,7 +198,7 @@ impl B2BuaEngine {
             last_invite_response: None,
         };
 
-        // REFACTOR: SdpBuilder Kullanımı
+        // REFACTOR: SdpBuilder
         let sdp_body = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
             .with_standard_codecs()
             .build();
@@ -237,7 +236,7 @@ impl B2BuaEngine {
     ) {
         info!("🚀 [BRIDGING] Bridging {} -> {}", from, callee_uri);
              
-        // REFACTOR: sip_core::utils::extract_socket_addr kullanımı
+        // REFACTOR: sip_utils::extract_socket_addr
         let callee_addr = sip_utils::extract_socket_addr(&callee_uri);
 
         let session = CallSession {
@@ -417,7 +416,7 @@ impl B2BuaEngine {
     }
 
     async fn send_sip_error(&self, req: &SipPacket, code: u16, reason: &str, target: SocketAddr) {
-        // REFACTOR: Core library
+        // REFACTOR: Core fonksiyon
         let resp = SipPacket::create_response_for(&req, code, reason.to_string());
         let _ = self.transport.send(&resp.to_bytes(), target).await;
     }
