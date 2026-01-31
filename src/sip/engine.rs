@@ -5,23 +5,38 @@ use tokio::sync::Mutex;
 use tracing::{info, error, debug, warn, instrument};
 use sentiric_sip_core::{SipPacket, Method, HeaderName, Header, utils as sip_utils};
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest, PlayAudioRequest};
+use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, CallEndedEvent, MediaInfo};
 use tonic::Request;
-use uuid;
-use prost_types;
+use uuid::Uuid;
+use prost_types::Timestamp;
+use prost::Message;
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
 use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use std::net::{SocketAddr, IpAddr};
+use std::time::SystemTime;
 
-// SIP URI'dan (örn: "sip:2001@10.88.0.1:39861") SocketAddr çıkarır.
+// SABİTLER
+const DEFAULT_REMOTE_RTP_PORT: u16 = 10000; // RTP portu bilinmiyorsa varsayılan
+const PROBE_SERVICE_NUMBER: &str = "9998"; // Özel servis numarası test için
+const ECHO_TEST_NUMBER: &str = "9999"; // Echo test numarası
+
+/// SIP URI'den Socket Adresi çıkaran yardımcı fonksiyon.
+/// İdealde sip-core içinde olmalı ama şimdilik burada izole ettik.
 fn extract_socket_addr_from_uri(uri: &str) -> Option<SocketAddr> {
     let mut s = uri.trim();
     s = s.trim_start_matches('<').trim_end_matches('>');
     if s.starts_with("sip:") { s = &s[4..]; } else if s.starts_with("sips:") { s = &s[5..]; }
-    let host_port_part = if let Some(at_idx) = s.find('@') { &s[at_idx + 1..] } else { s };
-    let host_port = if let Some(semi_idx) = host_port_part.find(';') { &host_port_part[..semi_idx] } else { host_port_part };
-    if !host_port.contains(':') { format!("{}:5060", host_port).parse().ok() } else { host_port.parse().ok() }
+    
+    let host_port_part = if let Some(semi_idx) = s.find(';') { &s[..semi_idx] } else { s };
+    let host_port = if let Some(at_idx) = host_port_part.find('@') { &host_port_part[at_idx + 1..] } else { host_port_part };
+    
+    if !host_port.contains(':') { 
+        format!("{}:5060", host_port).parse().ok() 
+    } else { 
+        host_port.parse().ok() 
+    }
 }
 
 pub struct B2BuaEngine {
@@ -32,6 +47,9 @@ pub struct B2BuaEngine {
     rabbitmq: Arc<RabbitMqClient>,
 }
 
+// =========================================================================================
+// BLOK 1: CORE EVENT LOOP & DISPATCHER
+// =========================================================================================
 impl B2BuaEngine {
     pub fn new(
         config: Arc<AppConfig>,
@@ -44,8 +62,7 @@ impl B2BuaEngine {
     }
 
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
-        // [TRACE]
-        info!("🔫 [TRACE-B2BUA] Paket Alındı. Method: {}, Src: {}", packet.method, src_addr);
+        debug!("🔫 [SIP-IN] {} from {}", packet.method, src_addr);
 
         if packet.is_request {
             match packet.method {
@@ -55,7 +72,7 @@ impl B2BuaEngine {
                 Method::Other(ref m) if m == "PUBLISH" || m == "MESSAGE" => {
                     self.handle_generic_success(packet, src_addr).await;
                 }
-                _ => { debug!("Method not handled: {:?}", packet.method); }
+                _ => { debug!("Method ignored: {:?}", packet.method); }
             }
         } else {
             self.handle_response(packet, src_addr).await;
@@ -67,7 +84,6 @@ impl B2BuaEngine {
         if let Some(session) = self.calls.get(&call_id) {
              if session.is_bridged {
                  if let Some(caller_addr) = session.caller_addr {
-                     info!("🔄 [BRIDGING] Relaying {} Response to Caller {}", resp.status_code, caller_addr);
                      if !resp.headers.is_empty() && resp.headers[0].name == HeaderName::Via { resp.headers.remove(0); }
                      resp.headers.retain(|h| h.name != HeaderName::Contact);
                      resp.headers.push(sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
@@ -76,195 +92,59 @@ impl B2BuaEngine {
              }
         }
     }
+}
 
-    async fn handle_generic_success(&self, req: SipPacket, src_addr: SocketAddr) {
-        let method_name = req.method.to_string();
-        info!("ℹ️ [{}] Request received, sending 200 OK (Dummy)", method_name);
-        let mut ok = SipPacket::new_response(200, "OK".to_string());
-        self.copy_headers(&mut ok, &req);
-        if let Some(exp) = req.get_header_value(HeaderName::Other("Expires".to_string())) {
-             ok.headers.push(Header::new(HeaderName::Other("Expires".to_string()), exp.clone()));
-        }
-        if let Err(e) = self.transport.send(&ok.to_bytes(), src_addr).await {
-            error!("Failed to send 200 OK for {}: {}", method_name, e);
-        }
-    }
-
+// =========================================================================================
+// BLOK 2: SIP METHOD HANDLERS (INVITE, BYE, ACK)
+// =========================================================================================
+impl B2BuaEngine {
     #[instrument(skip(self, req), fields(call_id = %req.get_header_value(HeaderName::CallId).unwrap_or(&"unknown".to_string())))]
     async fn handle_invite(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
-        if self.calls.contains_key(&call_id) {
-            if let Some(session) = self.calls.get(&call_id) {
-                if let Some(last_resp) = &session.last_invite_response {
-                    warn!("🔄 [SIP] Retransmission detected for {}, resending cached 200 OK.", call_id);
-                    let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
-                    return;
-                }
+        // 1. Idempotency Check
+        if let Some(session) = self.calls.get(&call_id) {
+            if let Some(last_resp) = &session.last_invite_response {
+                warn!(call_id, "🔄 Retransmission detected. Resending cached 200 OK.");
+                let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
+                return;
             }
         }
 
-        info!("📞 [INVITE] New Call Processing: {} -> {}", from, to);
-
+        // 2. Initial Response
         let mut trying = SipPacket::new_response(100, "Trying".to_string());
         self.copy_headers(&mut trying, &req);
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
         let local_tag = sip_utils::generate_tag("b2bua");
         
-        let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
+        let (remote_ip, remote_port) = self.extract_sdp_info(&req.body)
+            .unwrap_or((src_addr.ip(), DEFAULT_REMOTE_RTP_PORT));
         let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
 
-        // --- HEDEF KONTROLÜ (User vs AI) ---
-        let mut is_user_call = false;
-        let mut callee_contact: Option<String> = None;
+        // --- ROUTING LOGIC ---
         let to_user = sip_utils::extract_username_from_uri(&to);
         
-        if to_user != "9999" {
-             let mut clients = self.clients.lock().await;
-             let check_req = Request::new(sentiric_contracts::sentiric::user::v1::GetSipCredentialsRequest {
-                 sip_username: to_user.clone(),
-                 realm: self.config.sip_realm.clone(),
-             });
-
-             match clients.user.get_sip_credentials(check_req).await {
-                 Ok(_) => {
-                     info!("🔍 [ROUTING] Destination '{}' is a registered USER.", to_user);
-                     let lookup_req = Request::new(sentiric_contracts::sentiric::sip::v1::LookupContactRequest {
-                         sip_uri: format!("sip:{}@{}", to_user, self.config.sip_realm), 
-                     });
-                     
-                     if let Ok(lookup_res) = clients.registrar.lookup_contact(lookup_req).await {
-                         let uris = lookup_res.into_inner().contact_uris;
-                         if !uris.is_empty() {
-                             info!("✅ [ROUTING] User '{}' is ONLINE at {}", to_user, uris[0]);
-                             callee_contact = Some(uris[0].clone());
-                             is_user_call = true;
-                         } else {
-                             warn!("⚠️ [ROUTING] User '{}' found but is OFFLINE. Routing to AI.", to_user);
-                         }
-                     }
-                 },
-                 Err(_) => {
-                    info!("🔍 [ROUTING] Destination '{}' not found in database. Routing to AI.", to_user);
-                 }
-             }
-        }
-        
-        if is_user_call && callee_contact.is_some() {
-             let callee_uri = callee_contact.unwrap();
-             info!("🚀 [BRIDGING] Destination is a USER. Initiating Bridge for {} to {}", to_user, callee_uri);
-             
-             let session = CallSession {
-                 call_id: call_id.clone(),
-                 state: CallState::Invited,
-                 from_uri: from.clone(),
-                 to_uri: to.clone(),
-                 rtp_port: 0,
-                 local_tag: local_tag.clone(),
-                 caller_addr: Some(src_addr),
-                 callee_addr: extract_socket_addr_from_uri(&callee_uri),
-                 is_bridged: true,
-                 last_invite_response: None,
-             };
-             self.calls.insert(call_id.clone(), session);
-
-             let mut invite_b = req.clone();
-             invite_b.uri = callee_uri.clone();
-             let b2b_contact = sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port);
-             invite_b.headers.retain(|h| h.name != HeaderName::Contact);
-             invite_b.headers.push(b2b_contact);
-
-             if let Some(target) = extract_socket_addr_from_uri(&callee_uri) {
-                 let _ = self.transport.send(&invite_b.to_bytes(), target).await;
-                 info!("📤 [BRIDGING] INVITE (Leg B) sent to callee {}", target);
-             } else {
-                 error!("❌ [BRIDGING] Failed to parse callee address: {}", callee_uri);
-                 self.send_sip_error(&req, 500, "Internal Error", src_addr).await;
-             }
-             return; 
+        // A. Özel Numaralar
+        if self.is_special_service_number(&to_user) {
+             info!("🤖 Special Service Number Detected: {}", to_user);
+             // FIX: &req gönderiliyor
+             self.start_ai_flow(call_id, from, to, local_tag, src_addr, &req, rtp_target_str).await;
+             return;
         }
 
-        // --- AI FLOW ---
-        let rtp_port = match self.allocate_media_port(&call_id).await {
-            Ok(p) => p,
-            Err(e) => {
-                error!("❌ Media Allocation Failed: {}. Sending 503.", e);
-                self.send_sip_error(&req, 503, "Service Unavailable (Media)", src_addr).await;
-                return;
-            }
-        };
+        // B. Kullanıcı Kontrolü
+        let callee_contact = self.resolve_user_contact(&to_user).await;
 
-        let session = CallSession {
-            call_id: call_id.clone(),
-            state: CallState::Invited,
-            from_uri: from.clone(),
-            to_uri: to.clone(),
-            rtp_port,
-            local_tag: local_tag.clone(),
-            caller_addr: Some(src_addr),
-            callee_addr: None,
-            is_bridged: false,
-            last_invite_response: None,
-        };
-        
-        // SDP oluşturma
-        // G.729 (18), PCMU (0), PCMA (8) desteği
-        let sdp_body = format!(
-            "v=0\r\n\
-            o=- 123456 123456 IN IP4 {}\r\n\
-            s=SentiricB2BUA\r\n\
-            c=IN IP4 {}\r\n\
-            t=0 0\r\n\
-            m=audio {} RTP/AVP 18 0 8 101\r\n\
-            a=rtpmap:18 G729/8000\r\n\
-            a=rtpmap:0 PCMU/8000\r\n\
-            a=rtpmap:8 PCMA/8000\r\n\
-            a=rtpmap:101 telephone-event/8000\r\n\
-            a=fmtp:18 annexb=no\r\n\
-            a=fmtp:101 0-16\r\n\
-            a=ptime:20\r\n\
-            a=sendrecv\r\n",
-            self.config.public_ip, 
-            self.config.public_ip,
-            rtp_port
-        );
-
-        let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
-        self.copy_headers_with_tag(&mut ok_resp, &req, &local_tag);
-        let contact_header = sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port);
-        ok_resp.headers.push(contact_header);
-        ok_resp.headers.push(Header::new(HeaderName::Allow, "INVITE, ACK, BYE, CANCEL, OPTIONS".to_string()));
-        ok_resp.headers.push(Header::new(HeaderName::Supported, "replaces, timer".to_string()));
-        ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
-        ok_resp.body = sdp_body.as_bytes().to_vec();
-
-        let mut final_session = session;
-        final_session.last_invite_response = Some(ok_resp.clone());
-        self.calls.insert(call_id.clone(), final_session);
-
-        let response_bytes = ok_resp.to_bytes();
-        
-        if let Err(e) = self.transport.send(&response_bytes, src_addr).await {
-            error!("Failed to send 200 OK: {}", e);
-            self.release_media_port(rtp_port).await;
-            self.calls.remove(&call_id);
+        if let Some(callee_uri) = callee_contact {
+             // FIX: &req gönderiliyor
+             self.start_bridging_flow(call_id, from, to, local_tag, src_addr, &req, callee_uri).await;
         } else {
-            info!("✅ [SIP] 200 OK Sent (RTP Port: {})", rtp_port);
-            self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
-            self.trigger_hole_punching(rtp_port, rtp_target_str).await;
-        }
-    }
-
-    async fn send_sip_error(&self, req: &SipPacket, code: u16, reason: &str, target: SocketAddr) {
-        let mut resp = SipPacket::new_response(code, reason.to_string());
-        self.copy_headers(&mut resp, req);
-        if let Err(e) = self.transport.send(&resp.to_bytes(), target).await {
-            error!("Failed to send error response ({} {}): {}", code, reason, e);
-        } else {
-            info!("⚠️ Sent Error Response: {} {}", code, reason);
+             // C. Varsayılan AI Akışı
+             // FIX: &req gönderiliyor
+             self.start_ai_flow(call_id, from, to, local_tag, src_addr, &req, rtp_target_str).await;
         }
     }
 
@@ -272,12 +152,12 @@ impl B2BuaEngine {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         if let Some(mut session) = self.calls.get_mut(&call_id) {
             session.state = CallState::Established;
-            info!("✅ [ACK] Call Established: {}", call_id);
-            if session.is_bridged {
+            debug!(call_id, "✅ ACK Received. Call Established.");
+             if session.is_bridged {
                 let target = if session.callee_addr.is_some() { session.callee_addr } else { session.caller_addr };
                 if let Some(addr) = target {
                     info!("🔄 [BRIDGING] Relaying ACK to {}", addr);
-                    let ack_b = req.clone();
+                    let ack_b = req.clone(); 
                     let _ = self.transport.send(&ack_b.to_bytes(), addr).await;
                 }
             }
@@ -286,8 +166,6 @@ impl B2BuaEngine {
 
     async fn handle_bye(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        info!("🛑 [BYE] Request received for {}", call_id);
-
         let mut ok = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers(&mut ok, &req);
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
@@ -304,55 +182,278 @@ impl B2BuaEngine {
                     let _ = self.transport.send(&bye_b.to_bytes(), addr).await;
                 }
             }
-            if session.rtp_port > 0 {
-                self.release_media_port(session.rtp_port).await;
-            }
+            if session.rtp_port > 0 { self.release_media_port(session.rtp_port).await; }
             self.publish_call_ended(&call_id).await;
         }
     }
+    
+    async fn handle_generic_success(&self, req: SipPacket, src_addr: SocketAddr) {
+        let mut ok = SipPacket::new_response(200, "OK".to_string());
+        self.copy_headers(&mut ok, &req);
+        let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
+    }
+}
 
+// =========================================================================================
+// BLOK 3: BUSINESS FLOWS (AI, BRIDGE)
+// =========================================================================================
+impl B2BuaEngine {
+    async fn start_ai_flow(
+        &self, 
+        call_id: String, 
+        from: String, 
+        to: String, 
+        local_tag: String, 
+        src_addr: SocketAddr, 
+        req: &SipPacket, 
+        rtp_target_str: String
+    ) {
+        let rtp_port = match self.allocate_media_port(&call_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "Media Port Allocation FAILED.");
+                self.send_sip_error(req, 503, "Service Unavailable (Media)", src_addr).await;
+                return;
+            }
+        };
+
+        let session = CallSession {
+            call_id: call_id.clone(),
+            state: CallState::Invited,
+            from_uri: from.clone(),
+            to_uri: to.clone(),
+            rtp_port,
+            local_tag: local_tag.clone(),
+            caller_addr: Some(src_addr),
+            callee_addr: None,
+            is_bridged: false,
+            last_invite_response: None,
+        };
+
+        let sdp_body = format!(
+            "v=0\r\n\
+            o=- 123456 123456 IN IP4 {}\r\n\
+            s=SentiricB2BUA\r\n\
+            c=IN IP4 {}\r\n\
+            t=0 0\r\n\
+            m=audio {} RTP/AVP 18 8 0 101\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=fmtp:101 0-16\r\n\
+            a=sendrecv\r\n",
+            self.config.public_ip, self.config.public_ip, rtp_port
+        );
+
+        let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
+        self.copy_headers_with_tag(&mut ok_resp, req, &local_tag);
+        ok_resp.headers.push(sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
+        ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+        ok_resp.body = sdp_body.as_bytes().to_vec();
+
+        let mut final_session = session;
+        final_session.last_invite_response = Some(ok_resp.clone());
+        self.calls.insert(call_id.clone(), final_session);
+
+        if let Err(e) = self.transport.send(&ok_resp.to_bytes(), src_addr).await {
+            error!(error = %e, "Failed to send 200 OK.");
+            self.release_media_port(rtp_port).await;
+            self.calls.remove(&call_id);
+        } else {
+            info!(call_id, rtp_port, "AI Flow Started.");
+            self.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to).await;
+            self.trigger_hole_punching(rtp_port, rtp_target_str).await;
+        }
+    }
+
+    async fn start_bridging_flow(
+        &self, 
+        call_id: String, 
+        from: String, 
+        to: String, 
+        local_tag: String, 
+        src_addr: SocketAddr, 
+        req: &SipPacket, 
+        callee_uri: String
+    ) {
+        info!("🚀 [BRIDGING] Bridging {} -> {}", from, callee_uri);
+             
+        let session = CallSession {
+            call_id: call_id.clone(),
+            state: CallState::Invited,
+            from_uri: from.clone(),
+            to_uri: to.clone(),
+            rtp_port: 0,
+            local_tag: local_tag.clone(),
+            caller_addr: Some(src_addr),
+            callee_addr: extract_socket_addr_from_uri(&callee_uri),
+            is_bridged: true,
+            last_invite_response: None,
+        };
+        self.calls.insert(call_id.clone(), session);
+
+        let mut invite_b = req.clone();
+        invite_b.uri = callee_uri.clone();
+        let b2b_contact = sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port);
+        invite_b.headers.retain(|h| h.name != HeaderName::Contact);
+        invite_b.headers.push(b2b_contact);
+
+        if let Some(target) = extract_socket_addr_from_uri(&callee_uri) {
+            let _ = self.transport.send(&invite_b.to_bytes(), target).await;
+            info!("📤 [BRIDGING] INVITE (Leg B) sent to {}", target);
+        } else {
+            error!("❌ [BRIDGING] Failed to parse callee address: {}", callee_uri);
+            self.send_sip_error(req, 500, "Internal Error", src_addr).await;
+        }
+    }
+}
+
+// =========================================================================================
+// BLOK 4: EXTERNAL & OUTBOUND OPERATIONS
+// =========================================================================================
+impl B2BuaEngine {
+    // Agent Service veya başka bir servis tarafından çağrı başlatmak için kullanılır.
     pub async fn initiate_call(&self, call_id: String, from: String, to: String) -> anyhow::Result<()> {
-        info!("🚀 [OUTBOUND] Call initiation requested. ID: {}, From: {}, To: {}", call_id, from, to);
-        Ok(())
+        info!("🚀 [OUTBOUND] Initiating call: {} -> {} (CallID: {})", from, to, call_id);
+        
+        let target_addr: SocketAddr = self.config.proxy_sip_addr.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid proxy address: {}", e))?;
+
+        let mut invite = SipPacket::new_request(Method::Invite, to.clone());
+        
+        // Headerları manuel ekle
+        invite.headers.push(Header::new(HeaderName::From, format!("<{}>;tag={}", from, sip_utils::generate_tag("out"))));
+        invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to)));
+        invite.headers.push(Header::new(HeaderName::CallId, call_id.clone()));
+        invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
+        invite.headers.push(Header::new(HeaderName::MaxForwards, "70".to_string()));
+        invite.headers.push(sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
+        
+        // Medya portu hazırla
+        let rtp_port = self.allocate_media_port(&call_id).await?;
+        
+        // SDP Ekle
+        let sdp_body = format!(
+            "v=0\r\n\
+            o=- 111 111 IN IP4 {}\r\n\
+            s=SentiricOutbound\r\n\
+            c=IN IP4 {}\r\n\
+            t=0 0\r\n\
+            m=audio {} RTP/AVP 0 8 18 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendrecv\r\n",
+            self.config.public_ip, self.config.public_ip, rtp_port
+        );
+        invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+        invite.body = sdp_body.as_bytes().to_vec();
+
+        // State'e kaydet
+        let session = CallSession {
+            call_id: call_id.clone(),
+            state: CallState::Invited, // Outbound invited state
+            from_uri: from,
+            to_uri: to,
+            rtp_port,
+            local_tag: sip_utils::generate_tag("out"),
+            caller_addr: None, // Biz başlattık
+            callee_addr: Some(target_addr),
+            is_bridged: false,
+            last_invite_response: None,
+        };
+        self.calls.insert(call_id, session);
+
+        // Paketi gönder
+        self.transport.send(&invite.to_bytes(), target_addr).await
+            .map_err(|e| anyhow::anyhow!("Failed to send INVITE: {}", e))
+    }
+}
+
+// =========================================================================================
+// BLOK 5: INFRASTRUCTURE HELPERS (MEDIA, USER, REDIS)
+// =========================================================================================
+impl B2BuaEngine {
+    fn is_special_service_number(&self, user: &str) -> bool {
+        user == PROBE_SERVICE_NUMBER || user == ECHO_TEST_NUMBER
+    }
+
+    async fn resolve_user_contact(&self, username: &str) -> Option<String> {
+        let mut clients = self.clients.lock().await;
+        
+        let creds_req = Request::new(sentiric_contracts::sentiric::user::v1::GetSipCredentialsRequest {
+            sip_username: username.to_string(),
+            realm: self.config.sip_realm.clone(),
+        });
+
+        if clients.user.get_sip_credentials(creds_req).await.is_ok() {
+             let lookup_req = Request::new(sentiric_contracts::sentiric::sip::v1::LookupContactRequest {
+                 sip_uri: format!("sip:{}@{}", username, self.config.sip_realm), 
+             });
+             
+             if let Ok(lookup_res) = clients.registrar.lookup_contact(lookup_req).await {
+                 let uris = lookup_res.into_inner().contact_uris;
+                 if !uris.is_empty() {
+                     return Some(uris[0].clone());
+                 }
+             }
+        }
+        None
+    }
+
+    async fn allocate_media_port(&self, call_id: &str) -> anyhow::Result<u32> {
+        let mut clients = self.clients.lock().await;
+        let req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
+        let resp = clients.media.allocate_port(req).await?.into_inner();
+        Ok(resp.rtp_port)
+    }
+
+    async fn release_media_port(&self, port: u32) {
+        let mut clients = self.clients.lock().await;
+        let req = Request::new(ReleasePortRequest { rtp_port: port });
+        let _ = clients.media.release_port(req).await;
+    }
+
+    async fn trigger_hole_punching(&self, rtp_port: u32, target_addr: String) {
+        let mut clients = self.clients.lock().await;
+        let req = Request::new(PlayAudioRequest {
+            audio_uri: format!("file://audio/tr/system/nat_warmer.wav"),
+            server_rtp_port: rtp_port,
+            rtp_target_addr: target_addr,
+        });
+        
+        if let Err(e) = clients.media.play_audio(req).await {
+            warn!("⚠️ Hole punching trigger failed: {}", e);
+        }
     }
 
     async fn publish_call_started(&self, call_id: &str, server_port: u32, caller_rtp: &str, from: &str, to: &str) {
-        use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, MediaInfo};
-        use prost::Message;
         let event = CallStartedEvent {
             event_type: "call.started".to_string(),
-            trace_id: uuid::Uuid::new_v4().to_string(), 
+            trace_id: Uuid::new_v4().to_string(),
             call_id: call_id.to_string(),
             from_uri: from.to_string(),
             to_uri: to.to_string(),
-            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            timestamp: Some(Timestamp::from(SystemTime::now())),
             dialplan_resolution: None,
             media_info: Some(MediaInfo { caller_rtp_addr: caller_rtp.to_string(), server_rtp_port: server_port }),
         };
         let body = event.encode_to_vec();
-        if let Err(e) = self.rabbitmq.publish_event_bytes("call.started", &body).await {
-            error!("❌ [MQ] Failed to publish call.started: {}", e);
-        } else {
-            info!("📨 [MQ] Published call.started for {}", call_id);
-        }
+        let _ = self.rabbitmq.publish_event_bytes("call.started", &body).await;
     }
 
     async fn publish_call_ended(&self, call_id: &str) {
-        use sentiric_contracts::sentiric::event::v1::CallEndedEvent;
-        use prost::Message;
         let event = CallEndedEvent {
             event_type: "call.ended".to_string(),
-            trace_id: uuid::Uuid::new_v4().to_string(),
+            trace_id: Uuid::new_v4().to_string(),
             call_id: call_id.to_string(),
-            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            timestamp: Some(Timestamp::from(SystemTime::now())),
             reason: "normal_clearing".to_string(),
         };
         let body = event.encode_to_vec();
-        if let Err(e) = self.rabbitmq.publish_event_bytes("call.ended", &body).await {
-            error!("❌ [MQ] Failed to publish call.ended: {}", e);
-        } else {
-            info!("📨 [MQ] Published call.ended for {}", call_id);
-        }
+        let _ = self.rabbitmq.publish_event_bytes("call.ended", &body).await;
     }
 
     fn extract_sdp_info(&self, body: &[u8]) -> Option<(IpAddr, u16)> {
@@ -375,46 +476,19 @@ impl B2BuaEngine {
         if let (Some(i), Some(p)) = (ip, port) { Some((i, p)) } else { None }
     }
 
-    async fn allocate_media_port(&self, call_id: &str) -> anyhow::Result<u32> {
-        let mut clients = self.clients.lock().await;
-        let req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
-        let resp = clients.media.allocate_port(req).await?.into_inner();
-        Ok(resp.rtp_port)
-    }
-
-    async fn trigger_hole_punching(&self, rtp_port: u32, target_addr: String) {
-        let mut clients = self.clients.lock().await;
-        let audio_path = "audio/tr/system/nat_warmer.wav"; 
-        
-        let req = Request::new(PlayAudioRequest {
-            audio_uri: format!("file://{}", audio_path),
-            server_rtp_port: rtp_port,
-            rtp_target_addr: target_addr.clone(),
-        });
-        
-        info!("🔨 [B2BUA] Triggering Hole Punching -> {} on port {}", target_addr, rtp_port);
-        if let Err(e) = clients.media.play_audio(req).await {
-            warn!("⚠️ Hole punching request failed (Non-fatal, manual latching required): {}", e);
-        }
-    }
-
-    async fn release_media_port(&self, port: u32) {
-        let mut clients = self.clients.lock().await;
-        let req = Request::new(ReleasePortRequest { rtp_port: port });
-        let _ = clients.media.release_port(req).await;
-        info!("♻️ Released RTP Port: {}", port);
+    async fn send_sip_error(&self, req: &SipPacket, code: u16, reason: &str, target: SocketAddr) {
+        let mut resp = SipPacket::new_response(code, reason.to_string());
+        self.copy_headers(&mut resp, req);
+        let _ = self.transport.send(&resp.to_bytes(), target).await;
     }
 
     fn copy_headers(&self, resp: &mut SipPacket, req: &SipPacket) {
         for h in &req.headers {
-            match h.name {
-                HeaderName::Via | HeaderName::From | HeaderName::To | HeaderName::CallId | HeaderName::CSeq => {
-                    resp.headers.push(h.clone());
-                }
-                _ => {}
+            if matches!(h.name, HeaderName::Via | HeaderName::From | HeaderName::To | HeaderName::CallId | HeaderName::CSeq) {
+                resp.headers.push(h.clone());
             }
         }
-        resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA".to_string()));
+        resp.headers.push(Header::new(HeaderName::Server, "Sentiric B2BUA/1.2".to_string()));
     }
 
     fn copy_headers_with_tag(&self, resp: &mut SipPacket, req: &SipPacket, local_tag: &str) {
