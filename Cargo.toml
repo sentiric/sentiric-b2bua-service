@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-b2bua-service"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 
 [dependencies]
@@ -25,4 +25,4 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.13.6" }
-sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.2.12" }
+sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.3.1" }
