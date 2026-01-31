@@ -6,7 +6,8 @@ use tracing::{info, error, debug, warn, instrument};
 use sentiric_sip_core::{
     SipPacket, Method, HeaderName, Header, 
     utils as sip_utils, 
-    sdp::SdpBuilder
+    sdp::SdpBuilder,
+    builder as sip_builder // Eklendi
 };
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest, PlayAudioRequest};
 use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, CallEndedEvent, MediaInfo};
@@ -67,9 +68,12 @@ impl B2BuaEngine {
         if let Some(session) = self.calls.get(&call_id) {
              if session.is_bridged {
                  if let Some(caller_addr) = session.caller_addr {
-                     if !resp.headers.is_empty() && resp.headers[0].name == HeaderName::Via { resp.headers.remove(0); }
+                     // B2BUA Response Proxying Logic
+                     if !resp.headers.is_empty() && resp.headers[0].name == HeaderName::Via { 
+                         resp.headers.remove(0); 
+                     }
                      resp.headers.retain(|h| h.name != HeaderName::Contact);
-                     resp.headers.push(sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
+                     resp.headers.push(sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
                      let _ = self.transport.send(&resp.to_bytes(), caller_addr).await;
                  }
              }
@@ -84,6 +88,7 @@ impl B2BuaEngine {
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
+        // Idempotency / Retransmission Check
         if let Some(session) = self.calls.get(&call_id) {
             if let Some(last_resp) = &session.last_invite_response {
                 warn!(call_id, "🔄 Retransmission detected. Resending cached 200 OK.");
@@ -92,7 +97,6 @@ impl B2BuaEngine {
             }
         }
 
-        // REFACTOR: Core fonksiyon
         let trying = SipPacket::create_response_for(&req, 100, "Trying".to_string());
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
 
@@ -138,7 +142,6 @@ impl B2BuaEngine {
     async fn handle_bye(&self, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         
-        // REFACTOR: Core fonksiyon
         let ok = SipPacket::create_response_for(&req, 200, "OK".to_string());
         let _ = self.transport.send(&ok.to_bytes(), src_addr).await;
 
@@ -148,6 +151,7 @@ impl B2BuaEngine {
                 if let Some(addr) = target {
                     info!("🔄 [BRIDGING] Relaying BYE to {}", addr);
                     let mut bye_b = req.clone();
+                    // Via stripping for BYE
                     if !bye_b.headers.is_empty() && bye_b.headers[0].name == HeaderName::Via {
                         bye_b.headers.remove(0);
                     }
@@ -198,14 +202,15 @@ impl B2BuaEngine {
             last_invite_response: None,
         };
 
-        // REFACTOR: SdpBuilder
+        // [REFACTOR] SdpBuilder
         let sdp_body = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
             .with_standard_codecs()
             .build();
 
         let mut ok_resp = SipPacket::new_response(200, "OK".to_string());
         self.copy_headers_with_tag(&mut ok_resp, req, &local_tag);
-        ok_resp.headers.push(sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
+        
+        ok_resp.headers.push(sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
         ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         ok_resp.body = sdp_body.as_bytes().to_vec();
 
@@ -236,7 +241,6 @@ impl B2BuaEngine {
     ) {
         info!("🚀 [BRIDGING] Bridging {} -> {}", from, callee_uri);
              
-        // REFACTOR: sip_utils::extract_socket_addr
         let callee_addr = sip_utils::extract_socket_addr(&callee_uri);
 
         let session = CallSession {
@@ -255,7 +259,9 @@ impl B2BuaEngine {
 
         let mut invite_b = req.clone();
         invite_b.uri = callee_uri.clone();
-        let b2b_contact = sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port);
+        
+        let b2b_contact = sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port);
+        
         invite_b.headers.retain(|h| h.name != HeaderName::Contact);
         invite_b.headers.push(b2b_contact);
 
@@ -283,11 +289,12 @@ impl B2BuaEngine {
         invite.headers.push(Header::new(HeaderName::CallId, call_id.clone()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
         invite.headers.push(Header::new(HeaderName::MaxForwards, "70".to_string()));
-        invite.headers.push(sentiric_sip_core::builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
+        
+        invite.headers.push(sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
         
         let rtp_port = self.allocate_media_port(&call_id).await?;
         
-        // REFACTOR: SdpBuilder
+        // [REFACTOR] SdpBuilder
         let sdp_body = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
             .with_standard_codecs()
             .build();
@@ -416,7 +423,6 @@ impl B2BuaEngine {
     }
 
     async fn send_sip_error(&self, req: &SipPacket, code: u16, reason: &str, target: SocketAddr) {
-        // REFACTOR: Core fonksiyon
         let resp = SipPacket::create_response_for(&req, code, reason.to_string());
         let _ = self.transport.send(&resp.to_bytes(), target).await;
     }
