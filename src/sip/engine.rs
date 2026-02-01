@@ -9,6 +9,7 @@ use sentiric_sip_core::{
 };
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest, PlayAudioRequest};
 use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, CallEndedEvent, MediaInfo};
+use sentiric_contracts::sentiric::dialplan::v1::ResolveDialplanRequest; // YENİ
 use tonic::Request;
 use uuid::Uuid;
 use prost_types::Timestamp;
@@ -77,26 +78,15 @@ impl B2BuaEngine {
 
     #[instrument(skip(self, req), fields(call_id = %req.get_header_value(HeaderName::CallId).unwrap_or(&"unknown".to_string())))]
     async fn handle_invite(&self, req: SipPacket, src_addr: SocketAddr) {
-        
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-    
-        // 1. Session Var mı? (Retransmission Kontrolü)
-        if let Some(session) = self.calls.get(&call_id) {
-            // Eğer bu çağrı için daha önce bir cevap (200 OK) ürettiysek,
-            // YENİ BİR İŞLEM YAPMADAN aynısını gönderiyoruz.
-            if let Some(last_resp) = &session.last_invite_response {
-                info!(call_id, "🔄 Retransmission yakalandı. Önbellekteki yanıt tekrar gönderiliyor.");
-                let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
-                return; // ÇIKIŞ - Kritik nokta burası.
-            }
-        }
-        
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
-        let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
+        let to_header = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
+        let to_aor = sip_utils::extract_aor(&to_header);
 
+        // Retransmission kontrolü
         if let Some(session) = self.calls.get(&call_id) {
             if let Some(last_resp) = &session.last_invite_response {
-                warn!(call_id, "🔄 Retransmission detected. Resending cached 200 OK.");
+                warn!(call_id, "🔄 Retransmission detected. Resending cached response.");
                 let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
                 return;
             }
@@ -104,20 +94,47 @@ impl B2BuaEngine {
 
         let trying = SipPacket::create_response_for(&req, 100, "Trying".to_string());
         let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
-
-        let local_tag = sip_utils::generate_tag("b2bua");
-        let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), DEFAULT_REMOTE_RTP_PORT));
-        let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
-
-        let to_user = sip_utils::extract_username_from_uri(&to);
         
-        // B2BUA artık sadece "Dahili Transfer mi yapayım yoksa AI mı başlatayım?" diye sorar.
-        let callee_contact = self.resolve_user_contact(&to_user).await;
+        let local_tag = sip_utils::generate_tag("b2bua");
 
-        if let Some(callee_uri) = callee_contact {
-             self.start_bridging_flow(call_id, from, to, local_tag, src_addr, &req, callee_uri).await;
-        } else {
-             self.start_ai_flow(call_id, from, to, local_tag, src_addr, &req, rtp_target_str).await;
+        // --- DIALPLAN SORGUSU ---
+        let mut clients = self.clients.lock().await;
+        
+        let dialplan_req = Request::new(ResolveDialplanRequest {
+            caller_contact_value: from.clone(),
+            destination_number: to_aor.clone(),
+        });
+
+        match clients.dialplan.resolve_dialplan(dialplan_req).await {
+            Ok(res) => {
+                let resolution = res.into_inner();
+                let action = resolution.action.as_ref().map_or("START_AI_CONVERSATION", |a| a.action.as_str());
+                
+                info!(action, "✅ B2BUA: Dialplan kararı alındı.");
+
+                match action {
+                    "BRIDGE_CALL" => {
+                        let callee_username = sip_utils::extract_username_from_uri(&to_aor);
+                        if !callee_username.is_empty() {
+                            if let Some(contact_uri) = self.resolve_user_contact(&callee_username).await {
+                                 self.start_bridging_flow(call_id, from, to_header, local_tag, src_addr, &req, contact_uri).await;
+                                 return;
+                            }
+                        }
+                        error!("❌ BRIDGE_CALL için hedef contact bulunamadı (Username: {}).", callee_username);
+                        self.send_sip_error(&req, 404, "Not Found", src_addr).await;
+                    },
+                    _ => { // START_AI_CONVERSATION, START_ECHO_TEST vb.
+                        let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
+                        let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
+                        self.start_ai_flow(call_id, from, to_header, local_tag, src_addr, &req, rtp_target_str).await;
+                    }
+                }
+            },
+            Err(e) => {
+                error!(error = %e, "❌ B2BUA: Dialplan sorgusu başarısız.");
+                self.send_sip_error(&req, 503, "Service Unavailable", src_addr).await;
+            }
         }
     }
 

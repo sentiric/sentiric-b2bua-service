@@ -18,10 +18,10 @@ pub struct AppConfig {
     pub registrar_service_url: String,
     pub user_service_url: String,
     pub rabbitmq_url: String,
+    pub dialplan_service_url: String, // YENİ
     
     pub proxy_sip_addr: String,
     
-    // KRİTİK: Dış dünyaya bildirilecek IP (SDP ve Contact için)
     pub public_ip: String, 
     
     pub vendor_profile: String,
@@ -52,17 +52,14 @@ impl AppConfig {
         let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
             .unwrap_or_else(|_| "proxy-service:13074".to_string());
 
-        // ✅ KRİTİK DÜZELTME: Public IP zorunlu ve doğru formatta olmalı
         let public_ip = env::var("B2BUA_SERVICE_PUBLIC_IP")
-            .or_else(|_| env::var("NODE_IP")) // Fallback to Node IP
+            .or_else(|_| env::var("NODE_IP")) 
             .context("❌ FATAL: B2BUA_SERVICE_PUBLIC_IP veya NODE_IP tanımlı değil!")?;
        
-        // IP formatını validate et
         if public_ip.is_empty() || public_ip == "127.0.0.1" {
             anyhow::bail!("❌ FATAL: PUBLIC_IP geçersiz (boş veya localhost): {}", public_ip);
         }
         
-        // IP parse edilebilir mi kontrol et
         public_ip.parse::<std::net::IpAddr>()
             .context(format!("❌ PUBLIC_IP geçersiz format: {}", public_ip))?;
         
@@ -72,7 +69,7 @@ impl AppConfig {
             grpc_listen_addr: grpc_addr,
             http_listen_addr: http_addr, 
 
-            sip_bind_ip: "0.0.0.0".to_string(), // Dinlerken her yerden dinle
+            sip_bind_ip: "0.0.0.0".to_string(),
             sip_port,
             proxy_sip_addr: proxy_target,
 
@@ -81,12 +78,12 @@ impl AppConfig {
             registrar_service_url: env::var("REGISTRAR_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: REGISTRAR_SERVICE_TARGET_GRPC_URL")?,
             user_service_url: env::var("USER_SERVICE_TARGET_GRPC_URL").unwrap_or_else(|_| "https://user-service:12011".to_string()),
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
+            dialplan_service_url: env::var("DIALPLAN_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: DIALPLAN_SERVICE_TARGET_GRPC_URL")?, // YENİ
             
-            public_ip, // Artık doğru IP'yi taşıyor
+            public_ip,
             
             vendor_profile: env::var("VENDOR_PROFILE").unwrap_or_else(|_| "legacy".to_string()),
             
-            // SIP Settings
             sip_realm: env::var("SIP_REALM").unwrap_or_else(|_| "sip.azmisahin.com".to_string()),
             welcome_audio_path: env::var("WELCOME_AUDIO_PATH").unwrap_or_else(|_| "audio/tr/system/connecting.wav".to_string()),
 

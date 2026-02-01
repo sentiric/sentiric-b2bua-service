@@ -4,6 +4,7 @@ use crate::config::AppConfig;
 use anyhow::Result;
 use sentiric_contracts::sentiric::media::v1::media_service_client::MediaServiceClient;
 use sentiric_contracts::sentiric::sip::v1::registrar_service_client::RegistrarServiceClient;
+use sentiric_contracts::sentiric::dialplan::v1::dialplan_service_client::DialplanServiceClient;
 use tonic::transport::{Channel, ClientTlsConfig, Certificate, Identity};
 use std::time::Duration;
 use tracing::info;
@@ -12,6 +13,7 @@ pub struct InternalClients {
     pub media: MediaServiceClient<Channel>,
     pub registrar: RegistrarServiceClient<Channel>,
     pub user: sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClient<Channel>,
+    pub dialplan: DialplanServiceClient<Channel>, // YENİ
 }
 
 impl InternalClients {
@@ -21,11 +23,13 @@ impl InternalClients {
         let media_channel = create_secure_channel(&config.media_service_url, "media-service", config).await?;
         let registrar_channel = create_secure_channel(&config.registrar_service_url, "registrar-service", config).await?;
         let user_channel = create_secure_channel(&config.user_service_url, "user-service", config).await?;
+        let dialplan_channel = create_secure_channel(&config.dialplan_service_url, "dialplan-service", config).await?; // YENİ
 
         Ok(Self {
             media: MediaServiceClient::new(media_channel),
             registrar: RegistrarServiceClient::new(registrar_channel),
             user: sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClient::new(user_channel),
+            dialplan: DialplanServiceClient::new(dialplan_channel), // YENİ
         })
     }
 }
