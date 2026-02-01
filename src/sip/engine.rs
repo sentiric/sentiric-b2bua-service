@@ -77,7 +77,20 @@ impl B2BuaEngine {
 
     #[instrument(skip(self, req), fields(call_id = %req.get_header_value(HeaderName::CallId).unwrap_or(&"unknown".to_string())))]
     async fn handle_invite(&self, req: SipPacket, src_addr: SocketAddr) {
+        
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
+    
+        // 1. Session Var mı? (Retransmission Kontrolü)
+        if let Some(session) = self.calls.get(&call_id) {
+            // Eğer bu çağrı için daha önce bir cevap (200 OK) ürettiysek,
+            // YENİ BİR İŞLEM YAPMADAN aynısını gönderiyoruz.
+            if let Some(last_resp) = &session.last_invite_response {
+                info!(call_id, "🔄 Retransmission yakalandı. Önbellekteki yanıt tekrar gönderiliyor.");
+                let _ = self.transport.send(&last_resp.to_bytes(), src_addr).await;
+                return; // ÇIKIŞ - Kritik nokta burası.
+            }
+        }
+        
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
 
