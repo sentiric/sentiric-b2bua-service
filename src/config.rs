@@ -84,7 +84,7 @@ impl AppConfig {
             
             vendor_profile: env::var("VENDOR_PROFILE").unwrap_or_else(|_| "legacy".to_string()),
             
-            sip_realm: env::var("SIP_REALM").unwrap_or_else(|_| "sip.azmisahin.com".to_string()),
+            sip_realm: env::var("SIP_REALM").unwrap_or_else(|_| "sentiric_demo".to_string()),
             welcome_audio_path: env::var("WELCOME_AUDIO_PATH").unwrap_or_else(|_| "audio/tr/system/connecting.wav".to_string()),
 
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
