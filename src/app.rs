@@ -6,7 +6,7 @@ use crate::tls::load_server_tls_config;
 use crate::sip::engine::B2BuaEngine;
 use crate::sip::state::new_store;
 use crate::sip::server::SipServer;
-use crate::rabbitmq::RabbitMqClient; // YENİ
+use crate::rabbitmq::RabbitMqClient;
 use anyhow::{Context, Result};
 use sentiric_contracts::sentiric::sip::v1::b2bua_service_server::B2buaServiceServer;
 use std::convert::Infallible;
@@ -67,16 +67,15 @@ impl App {
         let clients = Arc::new(Mutex::new(InternalClients::connect(&self.config).await?));
         let calls = new_store();
 
-        // YENİ: RabbitMQ Bağlantısı
+        // 2. RabbitMQ
         info!("RabbitMQ'ya bağlanılıyor: {}", self.config.rabbitmq_url);
         let rabbitmq_client = Arc::new(RabbitMqClient::new(&self.config.rabbitmq_url).await
             .context("RabbitMQ bağlantısı başarısız")?);
 
-        // 2. Transport & Engine
+        // 3. SIP Transport & Engine
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
         let transport = Arc::new(SipTransport::new(&bind_addr).await?);
         
-        // DÜZELTME: rabbitmq_client argüman olarak eklendi
         let engine = Arc::new(B2BuaEngine::new(
             self.config.clone(), 
             clients, 
@@ -85,13 +84,13 @@ impl App {
             rabbitmq_client
         ));
 
-        // 3. SIP Server
+        // 4. SIP Server
         let sip_server = SipServer::new(engine.clone(), transport);
         let sip_handle = tokio::spawn(async move {
             sip_server.run(sip_shutdown_rx).await;
         });
 
-        // 4. gRPC Server
+        // 5. gRPC Server
         let grpc_config = self.config.clone();
         let grpc_server_handle = tokio::spawn(async move {
             let tls_config = load_server_tls_config(&grpc_config).await.expect("TLS hatası");
@@ -109,7 +108,7 @@ impl App {
                 .context("gRPC sunucusu çöktü")
         });
 
-        // 5. HTTP Server
+        // 6. HTTP Server
         let http_config = self.config.clone();
         let http_server_handle = tokio::spawn(async move {
             let addr = http_config.http_listen_addr;

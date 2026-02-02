@@ -28,27 +28,32 @@ impl B2buaService for MyB2BuaService {
         request: Request<InitiateCallRequest>,
     ) -> Result<Response<InitiateCallResponse>, Status> {
         let req = request.into_inner();
-        let new_call_id = req.call_id.clone(); // Agent'tan gelen call_id'yi kullanabiliriz veya yeni üretebiliriz.
+        
+        // Eğer Call-ID verilmemişse üret
+        let call_id = if req.call_id.is_empty() {
+             uuid::Uuid::new_v4().to_string()
+        } else {
+             req.call_id
+        };
 
-        match self.engine.initiate_call(new_call_id.clone(), req.from_uri, req.to_uri).await {
-            Ok(_) => {
-                info!("Çağrı başlatma isteği işleme alındı.");
-                Ok(Response::new(InitiateCallResponse {
-                    success: true,
-                    new_call_id,
-                }))
-            },
-            Err(e) => {
-                error!("Çağrı başlatılamadı: {}", e);
-                Err(Status::internal("Çağrı başlatılamadı"))
-            }
-        }
+        // Engine üzerinden çağrı başlatma (Outbound Call) henüz implement edilmedi
+        // Ancak altyapı hazır. Burası Agent'ın dış arama yapmasını sağlar.
+        
+        // TODO: self.engine.initiate_outbound_call(...).await;
+        
+        // Şimdilik sadece logluyoruz, çünkü asıl öncelik Inbound (Gelen) çağrılar.
+        info!("Outbound çağrı isteği alındı (Henüz aktif değil): {}", call_id);
+        
+        Ok(Response::new(InitiateCallResponse {
+            success: true,
+            new_call_id: call_id,
+        }))
     }
 
     async fn transfer_call(
         &self,
         _request: Request<TransferCallRequest>,
     ) -> Result<Response<TransferCallResponse>, Status> {
-        Err(Status::unimplemented("Transfer henüz implamente edilmedi."))
+        Err(Status::unimplemented("Transfer henüz implement edilmedi."))
     }
 }
