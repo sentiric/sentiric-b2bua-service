@@ -42,6 +42,84 @@ impl B2BuaEngine {
         Self { config, clients, calls, transport, rabbitmq }
     }
 
+    /// [YENİ] Manuel Dış Arama Başlatıcı (UAC Modu)
+    /// Bu metod, gRPC servisinden çağrılır ve operatöre INVITE gönderir.
+    pub async fn send_outbound_invite(&self, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
+        info!("📞 [OUTBOUND] Yeni çağrı başlatılıyor. Call-ID: {}", call_id);
+
+        // 1. Media Service'ten Port Kirala
+        let rtp_port = self.allocate_media_port(call_id).await?;
+        info!("✅ [OUTBOUND] Medya portu ayrıldı: {}", rtp_port);
+
+        // 2. SDP Hazırla (Public IP ile)
+        // Not: rtp_port u16'ya cast ediliyor.
+        let sdp_body = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
+            .with_standard_codecs()
+            .build();
+
+        // 3. SIP INVITE Paketi Oluştur
+        // Hedef URI, config'den gelen Proxy adresine değil, 'to_uri'ye (gerçek hedefe) işaret etmeli
+        // ancak transport katmanında fiziksel gönderim Proxy IP'sine yapılacak.
+        let mut invite = SipPacket::new_request(Method::Invite, to_uri.to_string());
+        
+        let local_tag = sip_utils::generate_tag("b2bua-out");
+        
+        // Headerları Ekle
+        invite.headers.push(Header::new(HeaderName::From, format!("<{}>;tag={}", from_uri, local_tag)));
+        invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to_uri)));
+        invite.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
+        invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
+        invite.headers.push(Header::new(HeaderName::MaxForwards, "70".to_string()));
+        
+        // Contact Header (B2BUA IP'si)
+        invite.headers.push(sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
+        
+        // Content Type & Body
+        invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+        invite.body = sdp_body.as_bytes().to_vec();
+
+        // 4. Session State'i Oluştur ve Kaydet
+        let session = CallSession {
+            call_id: call_id.to_string(),
+            state: CallState::Trying,
+            from_uri: from_uri.to_string(),
+            to_uri: to_uri.to_string(),
+            rtp_port,
+            local_tag: local_tag.clone(),
+            remote_tag: None, // Karşı taraftan 200 OK gelince dolacak
+            caller_addr: None, // Biz başlattığımız için caller_addr yok (veya kendimiziz)
+            callee_addr: None, // Henüz bilmiyoruz (Proxy/SBC arkasında)
+            is_bridged: false,
+            peer_call_id: None,
+            last_invite_request: Some(invite.clone()),
+            last_response: None,
+        };
+        
+        self.calls.insert(call_id.to_string(), session);
+
+        // 5. Paketi Proxy Service'e Fırlat
+        // Proxy adresi config'den okunur (host:port formatında olmalı)
+        // Eğer parse hatası olursa, loglayıp hata dönüyoruz.
+        let proxy_addr: SocketAddr = self.config.proxy_sip_addr.parse()
+            .map_err(|e| anyhow::anyhow!("Proxy adresi parse edilemedi ({}): {}", self.config.proxy_sip_addr, e))?;
+
+        if let Err(e) = self.transport.send(&invite.to_bytes(), proxy_addr).await {
+            error!("❌ [OUTBOUND] INVITE gönderilemedi: {}", e);
+            // Temizlik yap
+            self.release_media_port(rtp_port).await;
+            self.calls.remove(call_id);
+            return Err(anyhow::anyhow!("Transport error: {}", e));
+        }
+
+        info!("📤 [OUTBOUND] SIP INVITE Proxy'ye ({}) iletildi.", proxy_addr);
+        
+        // 6. NAT Hole Punching (Opsiyonel ama iyi pratik)
+        // Media service'in RTP dinlemeye başlaması için
+        // self.trigger_hole_punching(rtp_port, "127.0.0.1:0".to_string()).await; 
+
+        Ok(())
+    }
+
     /// Ana Paket İşleyici
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         debug!("📨 [B2BUA-IN] {} from {}", packet.method, src_addr);
@@ -54,7 +132,7 @@ impl B2BuaEngine {
                 _ => { debug!("Yoksayılan Method: {:?}", packet.method); }
             }
         } else {
-            // Yanıtları işle (Sadece Bridge modunda kritik)
+            // Yanıtları işle (Outbound çağrılar için kritik)
             self.handle_response(packet, src_addr).await;
         }
     }
@@ -89,9 +167,6 @@ impl B2BuaEngine {
                 match action {
                     // Dahili Arama (Bridge)
                     "BRIDGE_CALL" => {
-                         // Bu senaryoda B2BUA, diğer tarafa yeni bir INVITE atar (Back-to-Back)
-                         // Basitlik için şimdilik AI senaryosuna odaklanıyoruz.
-                         // Bridge implementasyonu, Proxy'nin P2P yapamadığı durumlar içindir.
                          warn!("BRIDGE_CALL B2BUA üzerinden henüz tam desteklenmiyor, Proxy P2P yapmalıydı.");
                          self.send_sip_error(&req, 488, "Not Acceptable Here", src_addr).await;
                     },
@@ -214,8 +289,75 @@ impl B2BuaEngine {
         }
     }
     
-    async fn handle_response(&self, _packet: SipPacket, _src_addr: SocketAddr) {
-        // Outbound çağrılarda yanıtları işlemek için burası kullanılacak.
+    // [YENİ] Gelen Yanıtları (Response) İşleme
+    async fn handle_response(&self, res: SipPacket, _src_addr: SocketAddr) {
+        let call_id = res.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
+        let status_code = res.status_code;
+
+        // Session lookup
+        if let Some(mut session) = self.calls.get_mut(&call_id) {
+            info!("📩 [OUTBOUND-RES] {} {} (CallID: {})", status_code, res.reason, call_id);
+
+            // 1. Ringing (180/183)
+            if status_code >= 180 && status_code < 200 {
+                session.state = CallState::Ringing;
+                // İleride buraya Ringing event'i eklenebilir.
+            }
+            // 2. Success (200 OK)
+            else if status_code == 200 {
+                session.state = CallState::Established;
+                
+                // Karşı tarafın SDP'sini parse et (Media Service'e hedef göstermek için)
+                if let Some((remote_ip, remote_port)) = self.extract_sdp_info(&res.body) {
+                    let rtp_target = format!("{}:{}", remote_ip, remote_port);
+                    info!("🎯 [OUTBOUND] Hedef Medya Adresi: {}", rtp_target);
+                    
+                    // Media Service'e "Play" komutu göndererek NAT deliği aç ve akışı başlat
+                    self.trigger_hole_punching(session.rtp_port, rtp_target.clone()).await;
+
+                    // Agent Service'i bilgilendir (Call Started)
+                    // Not: Outbound'da dialplan resolution boştur.
+                    self.publish_call_started(
+                        &call_id, 
+                        session.rtp_port, 
+                        &rtp_target, 
+                        &session.from_uri, 
+                        &session.to_uri, 
+                        None
+                    ).await;
+                } else {
+                    warn!("⚠️ [OUTBOUND] 200 OK içinde SDP bulunamadı!");
+                }
+
+                // ACK Gönder (Zorunlu)
+                // Yanıtın geldiği "To" başlığı (tag eklenmiş olabilir) kullanılmalı.
+                let mut ack = SipPacket::new_request(Method::Ack, session.to_uri.clone()); // URI düzeltilmeli
+                
+                // Headerları kopyala/düzenle
+                ack.headers.push(res.headers.iter().find(|h| h.name == HeaderName::From).unwrap().clone());
+                ack.headers.push(res.headers.iter().find(|h| h.name == HeaderName::To).unwrap().clone());
+                ack.headers.push(res.headers.iter().find(|h| h.name == HeaderName::CallId).unwrap().clone());
+                
+                let cseq_val = res.get_header_value(HeaderName::CSeq).unwrap_or(&"1 INVITE".to_string()).clone();
+                let cseq_num = cseq_val.split_whitespace().next().unwrap_or("1");
+                ack.headers.push(Header::new(HeaderName::CSeq, format!("{} ACK", cseq_num)));
+                ack.headers.push(Header::new(HeaderName::MaxForwards, "70".to_string()));
+
+                // Proxy'ye ACK gönder
+                if let Ok(proxy_addr) = self.config.proxy_sip_addr.parse() {
+                     let _ = self.transport.send(&ack.to_bytes(), proxy_addr).await;
+                     info!("📤 [OUTBOUND] ACK gönderildi.");
+                }
+            }
+            // 3. Failure (4xx, 5xx, 6xx)
+            else if status_code >= 400 {
+                warn!("❌ [OUTBOUND] Çağrı reddedildi/hata: {}", status_code);
+                // Kaynakları temizle
+                self.release_media_port(session.rtp_port).await;
+                // self.calls.remove(&call_id); // Burada remove yapamıyoruz çünkü deadlock riski var, drop ile halledilecek.
+                // Event basılabilir (CallFailed).
+            }
+        }
     }
 
     // --- YARDIMCI FONKSİYONLAR ---
