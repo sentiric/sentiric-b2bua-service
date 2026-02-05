@@ -17,7 +17,6 @@ use crate::sip::state::{CallStore, CallSession, CallState};
 use crate::rabbitmq::RabbitMqClient;
 use std::net::{SocketAddr, IpAddr};
 
-// ✅ YENİ MODÜLLER
 use crate::sip::handlers::media::MediaManager;
 use crate::sip::handlers::events::EventManager;
 
@@ -26,8 +25,6 @@ pub struct B2BuaEngine {
     clients: Arc<Mutex<InternalClients>>,
     calls: CallStore,
     transport: Arc<sentiric_sip_core::SipTransport>,
-    
-    // ✅ YENİ YÖNETİCİLER
     media_mgr: MediaManager,
     event_mgr: EventManager,
 }
@@ -45,14 +42,12 @@ impl B2BuaEngine {
             clients: clients.clone(), 
             calls, 
             transport,
-            // Alt modüller initialize ediliyor
             media_mgr: MediaManager::new(clients, config),
             event_mgr: EventManager::new(rabbitmq),
         }
     }
 
     pub async fn send_outbound_invite(&self, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
-         // MediaManager kullanılıyor
          let rtp_port = self.media_mgr.allocate_port(call_id).await?;
          let sdp_body = self.media_mgr.generate_sdp(rtp_port);
 
@@ -94,7 +89,6 @@ impl B2BuaEngine {
         Ok(())
     }
 
-    /// Ana Paket İşleyici
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         debug!("📨 [B2BUA-IN] {} from {} (CallID: {})", packet.method, src_addr, call_id);
@@ -137,13 +131,20 @@ impl B2BuaEngine {
         let to_header = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
         let to_aor = sip_utils::extract_aor(&to_header);
 
+        // 1. Transaction Başlat ve Hemen 100 Trying Gönder (CRITICAL FIX)
         let mut transaction = sentiric_sip_core::SipTransaction::new(&req);
-        
         let trying = SipPacket::create_response_for(&req, 100, "Trying".to_string());
+        
         if let Some(tx) = &mut transaction {
             tx.update_on_response(&trying);
         }
-        let _ = self.transport.send(&trying.to_bytes(), src_addr).await;
+        
+        // Asenkron olarak gönder, hata olursa logla ama süreci durdurma
+        if let Err(e) = self.transport.send(&trying.to_bytes(), src_addr).await {
+            error!("❌ [100 Trying] Gönderilemedi: {}", e);
+        } else {
+            debug!("📤 [100 Trying] Gönderildi.");
+        }
         
         let local_tag = sip_utils::generate_tag("b2bua");
 
@@ -156,19 +157,30 @@ impl B2BuaEngine {
         match clients.dialplan.resolve_dialplan(dialplan_req).await {
             Ok(res) => {
                 let resolution = res.into_inner();
-                let action = resolution.action.as_ref().map_or("UNKNOWN", |a| a.action.as_str());
+                // ActionData içindeki action'ı veya ana Action stringini kullan
+                let action = if let Some(da) = &resolution.action {
+                    da.action.as_str()
+                } else {
+                    "UNKNOWN"
+                };
                 
                 info!(action, "🗺️ Dialplan Kararı Alındı");
+
+                let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
+                let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
 
                 match action {
                     "BRIDGE_CALL" => {
                          warn!("BRIDGE_CALL B2BUA üzerinden henüz tam desteklenmiyor.");
                          self.send_sip_error(&req, 488, "Not Acceptable Here", src_addr).await;
                     },
+                    "START_ECHO_TEST" => {
+                        // Echo Test: Medya portu al, 200 OK dön ve sesi geri yansıt (Loopback)
+                        info!("🔊 Echo Test Başlatılıyor...");
+                        self.start_ai_flow(call_id, from, to_header, local_tag, src_addr, &req, rtp_target_str, Some(resolution), transaction).await;
+                    },
                     _ => { 
-                        let (remote_ip, remote_port) = self.extract_sdp_info(&req.body).unwrap_or((src_addr.ip(), 10000));
-                        let rtp_target_str = format!("{}:{}", remote_ip, remote_port);
-                        
+                        // AI Conversation veya diğer durumlar
                         self.start_ai_flow(call_id, from, to_header, local_tag, src_addr, &req, rtp_target_str, Some(resolution), transaction).await;
                     }
                 }
@@ -245,6 +257,7 @@ impl B2BuaEngine {
             info!(call_id, rtp_port, "✅ AI Çağrısı Kabul Edildi (200 OK).");
             
             // EventManager ve MediaManager kullanılıyor
+            // Echo Test veya AI fark etmez, ikisi de medya başlatmalı
             self.event_mgr.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to, dialplan_res).await;
             self.media_mgr.trigger_hole_punching(rtp_port, rtp_target_str).await;
         }
@@ -321,7 +334,6 @@ impl B2BuaEngine {
         }
     }
 
-    // SDP Helper (Burada kalabilir, logic değil parsing)
     fn extract_sdp_info(&self, body: &[u8]) -> Option<(IpAddr, u16)> {
         let sdp_str = std::str::from_utf8(body).ok()?;
         let mut ip: Option<IpAddr> = None;
