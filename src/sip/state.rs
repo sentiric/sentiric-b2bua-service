@@ -1,7 +1,8 @@
+// sentiric-b2bua-service/src/sip/state.rs
 use std::sync::Arc;
 use std::net::SocketAddr;
 use dashmap::DashMap;
-use sentiric_sip_core::SipPacket;
+use sentiric_sip_core::SipTransaction; // DÜZELTME: SipPacket kaldırıldı
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallState {
@@ -21,7 +22,7 @@ pub struct CallSession {
     pub from_uri: String,
     pub to_uri: String,
     
-    // Medya Bilgileri (Media Service'ten alınan)
+    // Medya Bilgileri
     pub rtp_port: u32,
     
     // SIP Transaction State
@@ -29,19 +30,17 @@ pub struct CallSession {
     pub remote_tag: Option<String>,
     
     // Routing Bilgisi
-    pub caller_addr: Option<SocketAddr>, // Bacak A (Arayan)
-    pub callee_addr: Option<SocketAddr>, // Bacak B (Aranan)
+    pub caller_addr: Option<SocketAddr>,
+    pub callee_addr: Option<SocketAddr>,
     
     // Bridging
-    pub is_bridged: bool,   // Eğer true ise, medya P2P veya Bridge modundadır
-    pub peer_call_id: Option<String>, // Diğer bacağın ID'si (Bridge durumunda)
+    pub is_bridged: bool,
+    pub peer_call_id: Option<String>,
 
-    // Idempotency & Retransmission Cache
-    pub last_invite_request: Option<SipPacket>,
-    pub last_response: Option<SipPacket>,
+    // Transaction State Machine Object
+    pub active_transaction: Option<SipTransaction>,
 }
 
-// Global Store Tipi
 pub type CallStore = Arc<DashMap<String, CallSession>>;
 
 pub fn new_store() -> CallStore {
