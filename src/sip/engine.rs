@@ -131,7 +131,7 @@ impl B2BuaEngine {
         let to_header = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
         let to_aor = sip_utils::extract_aor(&to_header);
 
-        // 1. Transaction Başlat ve Hemen 100 Trying Gönder (CRITICAL FIX)
+        // 1. Transaction Başlat ve Hemen 100 Trying Gönder
         let mut transaction = sentiric_sip_core::SipTransaction::new(&req);
         let trying = SipPacket::create_response_for(&req, 100, "Trying".to_string());
         
@@ -139,7 +139,6 @@ impl B2BuaEngine {
             tx.update_on_response(&trying);
         }
         
-        // Asenkron olarak gönder, hata olursa logla ama süreci durdurma
         if let Err(e) = self.transport.send(&trying.to_bytes(), src_addr).await {
             error!("❌ [100 Trying] Gönderilemedi: {}", e);
         } else {
@@ -148,16 +147,22 @@ impl B2BuaEngine {
         
         let local_tag = sip_utils::generate_tag("b2bua");
 
-        let mut clients = self.clients.lock().await;
-        let dialplan_req = Request::new(ResolveDialplanRequest {
-            caller_contact_value: from.clone(),
-            destination_number: to_aor.clone(),
-        });
+        // [DEADLOCK FIX] Mutex Scope Isolation
+        // Mutex kilidini sadece bu bloğun içinde tutuyoruz.
+        // Blok bittiğinde 'clients' değişkeni düşer ve kilit serbest kalır.
+        let dialplan_result = {
+            let mut clients = self.clients.lock().await; // KİLİT ALINDI
+            let dialplan_req = Request::new(ResolveDialplanRequest {
+                caller_contact_value: from.clone(),
+                destination_number: to_aor.clone(),
+            });
+            clients.dialplan.resolve_dialplan(dialplan_req).await
+        }; // KİLİT BIRAKILDI (Scope End)
 
-        match clients.dialplan.resolve_dialplan(dialplan_req).await {
+        // Artık kilit elimizde değil, özgürce başka asenkron işler yapabiliriz.
+        match dialplan_result {
             Ok(res) => {
                 let resolution = res.into_inner();
-                // ActionData içindeki action'ı veya ana Action stringini kullan
                 let action = if let Some(da) = &resolution.action {
                     da.action.as_str()
                 } else {
@@ -175,12 +180,12 @@ impl B2BuaEngine {
                          self.send_sip_error(&req, 488, "Not Acceptable Here", src_addr).await;
                     },
                     "START_ECHO_TEST" => {
-                        // Echo Test: Medya portu al, 200 OK dön ve sesi geri yansıt (Loopback)
                         info!("🔊 Echo Test Başlatılıyor...");
+                        // Burada tekrar kilit almaya çalışacağız (allocate_port içinde), 
+                        // ama yukarıda bıraktığımız için artık DEADLOCK OLMAYACAK.
                         self.start_ai_flow(call_id, from, to_header, local_tag, src_addr, &req, rtp_target_str, Some(resolution), transaction).await;
                     },
                     _ => { 
-                        // AI Conversation veya diğer durumlar
                         self.start_ai_flow(call_id, from, to_header, local_tag, src_addr, &req, rtp_target_str, Some(resolution), transaction).await;
                     }
                 }
@@ -204,7 +209,7 @@ impl B2BuaEngine {
         dialplan_res: Option<sentiric_contracts::sentiric::dialplan::v1::ResolveDialplanResponse>,
         mut transaction: Option<sentiric_sip_core::SipTransaction>
     ) {
-        // MediaManager kullanılıyor
+        // MediaManager kullanılıyor (İçinde tekrar lock alacak, bu güvenli)
         let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
             Ok(p) => p,
             Err(e) => {
@@ -257,7 +262,6 @@ impl B2BuaEngine {
             info!(call_id, rtp_port, "✅ AI Çağrısı Kabul Edildi (200 OK).");
             
             // EventManager ve MediaManager kullanılıyor
-            // Echo Test veya AI fark etmez, ikisi de medya başlatmalı
             self.event_mgr.publish_call_started(&call_id, rtp_port, &rtp_target_str, &from, &to, dialplan_res).await;
             self.media_mgr.trigger_hole_punching(rtp_port, rtp_target_str).await;
         }
