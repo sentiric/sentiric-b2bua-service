@@ -10,6 +10,7 @@ use tonic::transport::{Channel, ClientTlsConfig, Certificate, Identity};
 use std::time::Duration;
 use tracing::{info, error, warn}; // Error ve Warn logları eklendi
 
+#[derive(Clone)]
 pub struct InternalClients {
     pub media: MediaServiceClient<Channel>,
     pub registrar: RegistrarServiceClient<Channel>,
