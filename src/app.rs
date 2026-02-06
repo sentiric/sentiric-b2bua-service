@@ -21,6 +21,7 @@ use hyper::{
     Body, Request, Response, Server as HttpServer, StatusCode,
 };
 use sentiric_sip_core::SipTransport;
+use std::time::Duration; // YENİ EKLENDİ
 
 pub struct App {
     config: Arc<AppConfig>,
@@ -63,8 +64,31 @@ impl App {
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
 
-        // 1. Clients
-        let clients = Arc::new(Mutex::new(InternalClients::connect(&self.config).await?));
+        // --- KRİTİK DEĞİŞİKLİK: DAYANIKLI BAĞLANTI DÖNGÜSÜ ---
+        let clients = loop {
+            // Kapatma sinyali gelirse hemen çık
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => {
+                    info!("Bağlantı kurulurken kapatma sinyali alındı, çıkılıyor.");
+                    return Ok(());
+                },
+                res = InternalClients::connect(&self.config) => {
+                    match res {
+                        Ok(c) => {
+                            info!("✅ Tüm bağımlı servislere başarıyla bağlanıldı.");
+                            break Arc::new(Mutex::new(c));
+                        },
+                        Err(e) => {
+                            error!("❌ Bağımlı servislere bağlanılamadı: {:#}. 5 saniye sonra tekrar denenecek...", e);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+        };
+        // --- KRİTİK DEĞİŞİKLİK BİTTİ ---
+
         let calls = new_store();
 
         // 2. RabbitMQ
