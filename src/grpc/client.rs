@@ -8,7 +8,7 @@ use sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClie
 use sentiric_contracts::sentiric::dialplan::v1::dialplan_service_client::DialplanServiceClient;
 use tonic::transport::{Channel, ClientTlsConfig, Certificate, Identity};
 use std::time::Duration;
-use tracing::{info, error, warn};
+use tracing::{info, error, warn}; // Error ve Warn logları eklendi
 
 pub struct InternalClients {
     pub media: MediaServiceClient<Channel>,
@@ -21,11 +21,12 @@ impl InternalClients {
     pub async fn connect(config: &AppConfig) -> Result<Self> {
         info!("🔌 İç servislere bağlanılıyor (mTLS)...");
 
-        // Media Service Bağlantısı (Kritik Nokta - Detaylı Hata Yönetimi)
+        // Media Service Bağlantısı (Kritik Nokta)
         let media_channel = match create_secure_channel(&config.media_service_url, "media-service", config).await {
             Ok(c) => c,
             Err(e) => {
                 error!("❌ Media Service bağlantı hatası: {:#}", e);
+                // Burada panic yapmak yerine hatayı döndürüp uygulamanın kontrollü çökmesini sağlıyoruz
                 return Err(e);
             }
         };
@@ -46,7 +47,7 @@ impl InternalClients {
 }
 
 async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig) -> Result<Channel> {
-    // URL düzeltme (http -> https)
+    // URL düzeltme (http -> https zorlama)
     let target_url = if url.starts_with("http") {
         if url.starts_with("http://") {
              warn!("⚠️ Güvensiz URL tespit edildi ({}), HTTPS'e zorlanıyor.", url);
@@ -58,22 +59,20 @@ async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig)
         format!("https://{}", url)
     };
 
-    // 1. Sertifikaları Yükle (Hata Ayıklama Logları ile)
+    // Sertifikaları Yükle (Hata yakalama ile)
     let cert = tokio::fs::read(&config.cert_path).await
         .with_context(|| format!("İstemci Sertifikası okunamadı: {}", config.cert_path))?;
     
     let key = tokio::fs::read(&config.key_path).await
         .with_context(|| format!("İstemci Anahtarı okunamadı: {}", config.key_path))?;
     
+    let identity = Identity::from_pem(cert, key);
+
     let ca_cert = tokio::fs::read(&config.ca_path).await
         .with_context(|| format!("CA Sertifikası okunamadı: {}", config.ca_path))?;
-
-    // 2. Identity Oluştur
-    let identity = Identity::from_pem(cert, key);
+    
     let ca_certificate = Certificate::from_pem(ca_cert);
 
-    // 3. TLS Yapılandırması
-    // server_name (SNI), sunucunun sertifikasındaki CN/SAN ile eşleşmelidir.
     let tls_config = ClientTlsConfig::new()
         .domain_name(server_name)
         .ca_certificate(ca_certificate)
@@ -81,9 +80,9 @@ async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig)
 
     info!("🔗 Bağlanılıyor: {} (SNI: {})", target_url, server_name);
 
-    // 4. Kanal Oluştur
+    // Timeout eklenmiş bağlantı
     let channel = Channel::from_shared(target_url)?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5)) // 5 saniye bağlantı zaman aşımı
         .tls_config(tls_config)?
         .connect()
         .await
