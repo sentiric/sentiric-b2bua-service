@@ -19,6 +19,21 @@ impl MediaManager {
         Self { clients, config }
     }
 
+    /// [TELEKOM KRİTİK]: Ham SDP içeriğinden ses portunu ayıklar.
+    /// SBC ile Media Service arasındaki 'Sticky Port' eşleşmesi için kullanılır.
+    pub fn extract_port_from_sdp(&self, body: &[u8]) -> Option<u16> {
+        let sdp_text = String::from_utf8_lossy(body);
+        for line in sdp_text.lines() {
+            if line.starts_with("m=audio ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    return parts[1].parse().ok();
+                }
+            }
+        }
+        None
+    }
+
     pub async fn allocate_port(&self, call_id: &str) -> anyhow::Result<u32> {
         let mut media_client = {
             let clients_guard = self.clients.lock().await;
@@ -26,6 +41,7 @@ impl MediaManager {
         }; 
 
         let mut req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
+        // Trace ID'yi metadata'ya ekle
         req.metadata_mut().insert("x-trace-id", call_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
 
         let res = timeout(Duration::from_secs(3), media_client.allocate_port(req)).await?;
@@ -44,7 +60,7 @@ impl MediaManager {
 
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
         SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
-            .with_standard_codecs()
+            .with_standard_codecs() // G.729, PCMA, PCMU desteği
             .build()
             .as_bytes()
             .to_vec()

@@ -4,15 +4,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::{info, error}; // debug kaldırıldı (unused_import fix)
+use tracing::{info, error};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
     builder as sip_builder,
     transaction::SipTransaction,
 };
-
-// v1.15.0 Kontratları
 use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionType};
 use sentiric_contracts::sentiric::media::v1::PlayAudioRequest;
 use sentiric_rtp_core::RtpEndpoint;
@@ -44,11 +42,9 @@ impl CallHandler {
         let to_uri = SipUri::from_str(&to).unwrap_or_else(|_| SipUri::from_str("sip:unknown@sentiric.local").unwrap());
         let to_aor = to_uri.user.unwrap_or_default();
 
-        // 1. Ağ Sinyalleşmesi: 100 Trying
         let trying = SipResponseFactory::create_100_trying(&req);
         let _ = transport.send(&trying.to_bytes(), src_addr).await;
 
-        // 2. Dialplan Sorgusu (v1.15.0 uyumlu)
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             clients.dialplan.resolve_dialplan(Request::new(ResolveDialplanRequest {
@@ -61,13 +57,10 @@ impl CallHandler {
             Ok(response) => {
                 let resolution = response.into_inner();
                 let action = resolution.action.as_ref().unwrap();
-                
-                // [v1.15.0 FIX]: Prost, isimlendirmeyi sadeleştirir.
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
                 info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
 
-                // 3. Media Port Tahsisi
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -77,9 +70,13 @@ impl CallHandler {
                     }
                 };
 
+                // [TELEKOM MİMARİSİ]: SBC'nin iç ağdaki RTP portunu öğren
+                let sbc_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(30000);
+                let sbc_rtp_target = SocketAddr::new(src_addr.ip(), sbc_media_port);
+
                 // --- NATIVE TELECOM BRANCH: ECHO TEST ---
                 if action_type == ActionType::EchoTest {
-                    info!("🔊 [PBX-MODE] Activating Native Echo for {}", call_id);
+                    info!("🔊 [PBX-MODE] Activating Native Echo. Target: {}", sbc_rtp_target);
                     
                     let mut media_client = {
                         let guard = self.clients.lock().await;
@@ -89,12 +86,11 @@ impl CallHandler {
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: src_addr.to_string(),
+                        rtp_target_addr: sbc_rtp_target.to_string(),
                     })).await;
                 }
-                // ----------------------------------------
 
-                // 4. SIP Session & 200 OK
+                // 200 OK & Handshake
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
 
@@ -111,7 +107,7 @@ impl CallHandler {
 
                 let session = CallSession {
                     call_id: call_id.clone(),
-                    state: CallState::Established, 
+                    state: CallState::Established,
                     from_uri: from.clone(),
                     to_uri: to.clone(),
                     rtp_port,
@@ -122,11 +118,8 @@ impl CallHandler {
                 self.calls.insert(call_id.clone(), session);
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
-                    // [v1.15.0 FIX]: Enum Check
                     if action_type != ActionType::EchoTest {
-                        self.event_mgr.publish_call_started(&call_id, rtp_port, &src_addr.to_string(), &from, &to, Some(resolution)).await;
-                    } else {
-                        info!("⏭️ [BYPASS] AI Orchestrator bypassed for Native Echo Call.");
+                        self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target.to_string(), &from, &to, Some(resolution)).await;
                     }
                 }
             },
