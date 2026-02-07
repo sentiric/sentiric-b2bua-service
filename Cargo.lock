@@ -2328,8 +2328,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-contracts"
-version = "1.13.7"
-source = "git+https://github.com/sentiric/sentiric-contracts.git?tag=v1.13.7#dd7c8f225ec7d96764308b95b5b50902b8cb4856"
+version = "1.14.0"
+source = "git+https://github.com/sentiric/sentiric-contracts.git?tag=v1.14.0#64ccce50efa6f6dda7c7ab9c0bb37145829c54ea"
 dependencies = [
  "prost",
  "prost-types",

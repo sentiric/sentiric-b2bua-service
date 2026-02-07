@@ -4,14 +4,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::error; // unused info ve debug kaldırıldı
+use tracing::{info, error, debug};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
     builder as sip_builder,
     transaction::SipTransaction,
 };
-use sentiric_contracts::sentiric::dialplan::v1::ResolveDialplanRequest;
+// v1.14.0 Kontratları
+use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionType};
+use sentiric_contracts::sentiric::media::v1::PlayAudioRequest;
 use sentiric_rtp_core::RtpEndpoint;
 use tonic::Request;
 use crate::config::AppConfig;
@@ -41,9 +43,11 @@ impl CallHandler {
         let to_uri = SipUri::from_str(&to).unwrap_or_else(|_| SipUri::from_str("sip:unknown@sentiric.local").unwrap());
         let to_aor = to_uri.user.unwrap_or_default();
 
+        // 1. Ağ Sinyalleşmesi: 100 Trying
         let trying = SipResponseFactory::create_100_trying(&req);
         let _ = transport.send(&trying.to_bytes(), src_addr).await;
 
+        // 2. Dialplan Sorgusu (v1.14.0 uyumlu)
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             clients.dialplan.resolve_dialplan(Request::new(ResolveDialplanRequest {
@@ -55,6 +59,14 @@ impl CallHandler {
         match dialplan_res {
             Ok(response) => {
                 let resolution = response.into_inner();
+                let action = resolution.action.as_ref().unwrap();
+                
+                // [FIX E0609 & E0599] Rust Reserved Word 'r#type' ve Enum variant isimlendirmesi
+                let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
+
+                info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
+
+                // 3. Media Port Tahsisi
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -64,6 +76,24 @@ impl CallHandler {
                     }
                 };
 
+                // --- NATIVE TELECOM BRANCH: ECHO TEST ---
+                if action_type == ActionType::EchoTest {
+                    info!("🔊 [PBX-MODE] Activating Native Echo for {}", call_id);
+                    
+                    let mut media_client = {
+                        let guard = self.clients.lock().await;
+                        guard.media.clone()
+                    };
+                    
+                    let _ = media_client.play_audio(Request::new(PlayAudioRequest {
+                        audio_uri: "control://enable_echo".to_string(),
+                        server_rtp_port: rtp_port,
+                        rtp_target_addr: src_addr.to_string(),
+                    })).await;
+                }
+                // ----------------------------------------
+
+                // 4. SIP Session & 200 OK
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
 
@@ -71,8 +101,6 @@ impl CallHandler {
                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                     if !to_h.value.contains(";tag=") { to_h.value.push_str(&format!(";tag={}", local_tag)); }
                 }
-                
-                // [v1.4.1 ALIGNMENT] build_contact_header artık core/builder içinde.
                 ok_resp.headers.push(sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
                 ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                 ok_resp.body = sdp_body;
@@ -93,7 +121,12 @@ impl CallHandler {
                 self.calls.insert(call_id.clone(), session);
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
-                    self.event_mgr.publish_call_started(&call_id, rtp_port, &src_addr.to_string(), &from, &to, Some(resolution)).await;
+                    // [E0599 FIX] Echo Test ise RabbitMQ AI Pipeline'ı tetikleme
+                    if action_type != ActionType::EchoTest {
+                        self.event_mgr.publish_call_started(&call_id, rtp_port, &src_addr.to_string(), &from, &to, Some(resolution)).await;
+                    } else {
+                        info!("⏭️ [BYPASS] AI Orchestrator bypassed for Native Echo Call.");
+                    }
                 }
             },
             Err(e) => {
@@ -103,6 +136,7 @@ impl CallHandler {
         }
     }
 
+    /// [E0599 FIX] Eksik outbound metodunun eklenmesi
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
         let rtp_port = self.media_mgr.allocate_port(call_id).await?;
         let sdp_body = self.media_mgr.generate_sdp(rtp_port);

@@ -35,7 +35,6 @@ impl B2BuaEngine {
         Self { calls, transport, call_handler }
     }
 
-    /// [E0599 FIX] Dış Arama (Outbound) başlatma komutu
     pub async fn send_outbound_invite(&self, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
         self.call_handler.process_outbound_invite(self.transport.clone(), call_id, from_uri, to_uri).await
     }
