@@ -4,14 +4,15 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::{info, error, debug};
+use tracing::{info, error}; // debug kaldırıldı (unused_import fix)
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
     builder as sip_builder,
     transaction::SipTransaction,
 };
-// v1.14.0 Kontratları
+
+// v1.15.0 Kontratları
 use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionType};
 use sentiric_contracts::sentiric::media::v1::PlayAudioRequest;
 use sentiric_rtp_core::RtpEndpoint;
@@ -47,7 +48,7 @@ impl CallHandler {
         let trying = SipResponseFactory::create_100_trying(&req);
         let _ = transport.send(&trying.to_bytes(), src_addr).await;
 
-        // 2. Dialplan Sorgusu (v1.14.0 uyumlu)
+        // 2. Dialplan Sorgusu (v1.15.0 uyumlu)
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             clients.dialplan.resolve_dialplan(Request::new(ResolveDialplanRequest {
@@ -61,7 +62,7 @@ impl CallHandler {
                 let resolution = response.into_inner();
                 let action = resolution.action.as_ref().unwrap();
                 
-                // [FIX E0609 & E0599] Rust Reserved Word 'r#type' ve Enum variant isimlendirmesi
+                // [v1.15.0 FIX]: Prost, isimlendirmeyi sadeleştirir.
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
                 info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
@@ -110,7 +111,7 @@ impl CallHandler {
 
                 let session = CallSession {
                     call_id: call_id.clone(),
-                    state: CallState::Trying,
+                    state: CallState::Established, 
                     from_uri: from.clone(),
                     to_uri: to.clone(),
                     rtp_port,
@@ -121,7 +122,7 @@ impl CallHandler {
                 self.calls.insert(call_id.clone(), session);
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
-                    // [E0599 FIX] Echo Test ise RabbitMQ AI Pipeline'ı tetikleme
+                    // [v1.15.0 FIX]: Enum Check
                     if action_type != ActionType::EchoTest {
                         self.event_mgr.publish_call_started(&call_id, rtp_port, &src_addr.to_string(), &from, &to, Some(resolution)).await;
                     } else {
@@ -136,7 +137,6 @@ impl CallHandler {
         }
     }
 
-    /// [E0599 FIX] Eksik outbound metodunun eklenmesi
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
         let rtp_port = self.media_mgr.allocate_port(call_id).await?;
         let sdp_body = self.media_mgr.generate_sdp(rtp_port);
