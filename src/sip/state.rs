@@ -1,8 +1,9 @@
 // sentiric-b2bua-service/src/sip/state.rs
+
 use std::sync::Arc;
-use std::net::SocketAddr;
 use dashmap::DashMap;
-use sentiric_sip_core::SipTransaction;
+use sentiric_sip_core::transaction::SipTransaction;
+use sentiric_rtp_core::RtpEndpoint;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallState {
@@ -21,10 +22,7 @@ pub struct CallSession {
     pub to_uri: String,
     pub rtp_port: u32,
     pub local_tag: String,
-    pub remote_tag: Option<String>,
-    pub caller_addr: Option<SocketAddr>,
-    pub callee_addr: Option<SocketAddr>,
-    pub is_bridged: bool,
+    pub endpoint: RtpEndpoint,
     pub active_transaction: Option<SipTransaction>,
 }
 

@@ -1,10 +1,18 @@
 // sentiric-b2bua-service/src/sip/handlers/calls.rs
+
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
-use tracing::{info, error, debug};
-use sentiric_sip_core::{SipPacket, HeaderName, builder as sip_builder, utils as sip_utils};
+use std::str::FromStr;
+use tracing::error; // unused info ve debug kaldırıldı
+use sentiric_sip_core::{
+    SipPacket, HeaderName, Header, SipUri,
+    builder::SipResponseFactory,
+    builder as sip_builder,
+    transaction::SipTransaction,
+};
 use sentiric_contracts::sentiric::dialplan::v1::ResolveDialplanRequest;
+use sentiric_rtp_core::RtpEndpoint;
 use tonic::Request;
 use crate::config::AppConfig;
 use crate::sip::state::{CallStore, CallSession, CallState};
@@ -21,13 +29,7 @@ pub struct CallHandler {
 }
 
 impl CallHandler {
-    pub fn new(
-        config: Arc<AppConfig>,
-        clients: Arc<Mutex<InternalClients>>,
-        calls: CallStore,
-        media_mgr: MediaManager,
-        event_mgr: EventManager,
-    ) -> Self {
+    pub fn new(config: Arc<AppConfig>, clients: Arc<Mutex<InternalClients>>, calls: CallStore, media_mgr: MediaManager, event_mgr: EventManager) -> Self {
         Self { config, clients, calls, media_mgr, event_mgr }
     }
 
@@ -35,13 +37,13 @@ impl CallHandler {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
-        let to_aor = sip_utils::extract_aor(&to);
+        
+        let to_uri = SipUri::from_str(&to).unwrap_or_else(|_| SipUri::from_str("sip:unknown@sentiric.local").unwrap());
+        let to_aor = to_uri.user.unwrap_or_default();
 
-        // 1. Ağ el sıkışması
-        let trying = SipPacket::create_response_for(&req, 100, "Trying".to_string());
+        let trying = SipResponseFactory::create_100_trying(&req);
         let _ = transport.send(&trying.to_bytes(), src_addr).await;
 
-        // 2. Karar verici katman sorgusu (Kilit yönetimi ile)
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             clients.dialplan.resolve_dialplan(Request::new(ResolveDialplanRequest {
@@ -53,30 +55,31 @@ impl CallHandler {
         match dialplan_res {
             Ok(response) => {
                 let resolution = response.into_inner();
-                
-                // 3. Medya kaynağı tahsisi
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!("Media allocation failure: {}", e);
-                        self.send_error(transport, &req, 503, "Media Engine Unavailable", src_addr).await;
+                        error!("❌ Media failure: {}", e);
+                        let _ = transport.send(&SipResponseFactory::create_error(&req, 503, "Media Error").to_bytes(), src_addr).await;
                         return;
                     }
                 };
 
-                let local_tag = sip_utils::generate_tag("sentiric-b2bua");
+                let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
 
-                // 4. Kabul yanıtı hazırlama
-                let mut ok_resp = SipPacket::create_response_for(&req, 200, "OK".to_string());
+                let mut ok_resp = SipResponseFactory::create_200_ok(&req);
                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                     if !to_h.value.contains(";tag=") { to_h.value.push_str(&format!(";tag={}", local_tag)); }
                 }
+                
+                // [v1.4.1 ALIGNMENT] build_contact_header artık core/builder içinde.
                 ok_resp.headers.push(sip_builder::build_contact_header("b2bua", &self.config.public_ip, self.config.sip_port));
-                ok_resp.headers.push(sentiric_sip_core::Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+                ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                 ok_resp.body = sdp_body;
 
-                // 5. Oturum kaydı
+                let mut tx = SipTransaction::new(&req).unwrap();
+                tx.update_with_response(&ok_resp);
+
                 let session = CallSession {
                     call_id: call_id.clone(),
                     state: CallState::Trying,
@@ -84,47 +87,63 @@ impl CallHandler {
                     to_uri: to.clone(),
                     rtp_port,
                     local_tag,
-                    remote_tag: None,
-                    caller_addr: Some(src_addr),
-                    callee_addr: None,
-                    is_bridged: false,
-                    active_transaction: Some(sentiric_sip_core::SipTransaction::new(&req).unwrap()),
+                    endpoint: RtpEndpoint::new(None),
+                    active_transaction: Some(tx),
                 };
                 self.calls.insert(call_id.clone(), session);
 
-                // 6. Finalizasyon
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &src_addr.to_string(), &from, &to, Some(resolution)).await;
                 }
             },
             Err(e) => {
-                error!("Dialplan resolution error: {}", e);
-                self.send_error(transport, &req, 500, "Routing Failure", src_addr).await;
+                error!("❌ Dialplan failure: {}", e);
+                let _ = transport.send(&SipResponseFactory::create_error(&req, 500, "Routing Error").to_bytes(), src_addr).await;
             }
         }
     }
 
+    pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
+        let rtp_port = self.media_mgr.allocate_port(call_id).await?;
+        let sdp_body = self.media_mgr.generate_sdp(rtp_port);
+
+        let mut invite = SipPacket::new_request(sentiric_sip_core::Method::Invite, to_uri.to_string());
+        let local_tag = sentiric_sip_core::utils::generate_tag("b2bua-out");
+        
+        invite.headers.push(Header::new(HeaderName::From, format!("<{}>;tag={}", from_uri, local_tag)));
+        invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to_uri)));
+        invite.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
+        invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
+        invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+        invite.body = sdp_body;
+
+        let session = CallSession {
+            call_id: call_id.to_string(),
+            state: CallState::Trying,
+            from_uri: from_uri.to_string(),
+            to_uri: to_uri.to_string(),
+            rtp_port,
+            local_tag,
+            endpoint: RtpEndpoint::new(None),
+            active_transaction: None,
+        };
+        self.calls.insert(call_id.to_string(), session);
+
+        let proxy_addr: SocketAddr = self.config.proxy_sip_addr.parse()?;
+        transport.send(&invite.to_bytes(), proxy_addr).await?;
+        Ok(())
+    }
+
     pub async fn process_bye(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        let ok = SipPacket::create_response_for(&req, 200, "OK".to_string());
-        let _ = transport.send(&ok.to_bytes(), src_addr).await;
-
+        let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
         if let Some((_, session)) = self.calls.remove(&call_id) {
             self.media_mgr.release_port(session.rtp_port).await;
             self.event_mgr.publish_call_ended(&call_id).await;
-            info!("Call context cleared: {}", call_id);
         }
     }
 
     pub async fn process_ack(&self, call_id: &str) {
-        if let Some(mut s) = self.calls.get_mut(call_id) {
-            s.state = CallState::Established;
-            debug!("Call established for: {}", call_id);
-        }
-    }
-
-    async fn send_error(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: &SipPacket, code: u16, reason: &str, target: SocketAddr) {
-        let resp = SipPacket::create_response_for(req, code, reason.to_string());
-        let _ = transport.send(&resp.to_bytes(), target).await;
+        if let Some(mut s) = self.calls.get_mut(call_id) { s.state = CallState::Established; }
     }
 }
