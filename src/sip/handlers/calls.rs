@@ -57,6 +57,7 @@ impl CallHandler {
             Ok(response) => {
                 let resolution = response.into_inner();
                 let action = resolution.action.as_ref().unwrap();
+                // [DÜZELTME]: Enum varyantı 'Unspecified' olarak kullanılıyor.
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
                 info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
@@ -70,11 +71,11 @@ impl CallHandler {
                     }
                 };
 
-                // [TELEKOM MİMARİSİ]: SBC'nin iç ağdaki RTP portunu öğren
                 let sbc_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(30000);
                 let sbc_rtp_target = SocketAddr::new(src_addr.ip(), sbc_media_port);
 
                 // --- NATIVE TELECOM BRANCH: ECHO TEST ---
+                // [DÜZELTME]: Enum varyantı 'EchoTest' olarak kullanılıyor.
                 if action_type == ActionType::EchoTest {
                     info!("🔊 [PBX-MODE] Activating Native Echo. Target: {}", sbc_rtp_target);
                     
@@ -83,6 +84,15 @@ impl CallHandler {
                         guard.media.clone()
                     };
                     
+                    // 1. Hole Punching (Tünel Açma)
+                    info!("🔨 [HOLE-PUNCH] Sending warmer packet to open SBC latch.");
+                    let _ = media_client.play_audio(Request::new(PlayAudioRequest {
+                        audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
+                        server_rtp_port: rtp_port,
+                        rtp_target_addr: sbc_rtp_target.to_string(),
+                    })).await;
+
+                    // 2. Echo Modunu Başlat
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port,
@@ -118,6 +128,7 @@ impl CallHandler {
                 self.calls.insert(call_id.clone(), session);
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
+                    // [DÜZELTME]: Enum varyantı 'EchoTest' olarak kullanılıyor.
                     if action_type != ActionType::EchoTest {
                         self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target.to_string(), &from, &to, Some(resolution)).await;
                     }

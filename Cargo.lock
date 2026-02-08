@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "sentiric-b2bua-service"
-version = "1.4.1"
+version = "1.4.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2328,8 +2328,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-contracts"
-version = "1.15.0"
-source = "git+https://github.com/sentiric/sentiric-contracts.git?tag=v1.15.0#bdfb67253106fdb6d2a13e10846d9c3fc1be6327"
+version = "1.16.0"
+source = "git+https://github.com/sentiric/sentiric-contracts.git?tag=v1.16.0#c5cb6742d5f6e0429d33e29025f2dc9363d2441d"
 dependencies = [
  "prost",
  "prost-types",
@@ -2340,8 +2340,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-rtp-core"
-version = "1.3.0"
-source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.3.0#82423645a342165c054420f01f8dd20123174c6d"
+version = "1.3.1"
+source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.3.1#1d261d80fea2dce8d78a63d0f9219ff14c3c1df0"
 dependencies = [
  "cc",
  "glob",

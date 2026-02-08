@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-b2bua-service"
-version = "1.4.1"
+version = "1.4.3" # Versiyon artırıldı (Echo Fix + v1.16.0)
 edition = "2021"
 
 [dependencies]
@@ -8,7 +8,7 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.11", features = ["tls", "tls-roots"] }
 prost = "0.12"
-prost-types = "0.12" # EKLENDİ
+prost-types = "0.12"
 hyper = { version = "0.14", features = ["full"] }
 
 # Observability
@@ -28,6 +28,6 @@ lapin = "2.3.1"
 redis = { version = "0.26", features = ["tokio-rustls-comp"] }
 
 # --- THE IRON CORE (UPGRADED) ---
-sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.3.0" }
+sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.3.1" }
 sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.4.1" }
-sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.15.0" }
+sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.16.0" }
