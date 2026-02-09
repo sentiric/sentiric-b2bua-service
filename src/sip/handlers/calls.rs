@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::{info, error};
+use tokio::net::lookup_host; // DNS ÇÖZÜMLEME İÇİN EKLENDİ
+use tracing::{info, error, warn}; // WARN EKLENDİ
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -70,8 +71,6 @@ impl CallHandler {
                     }
                 };
                 
-                // [CRITICAL FIX]: Hedefi `src_addr` (Proxy'nin IP'si) yerine, SDP'den gelen gerçek müşteri IP'si olarak al.
-                // Bu, B2BUA'nın RabbitMQ'ya doğru bilgiyi basmasını sağlar.
                 let client_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(30000);
                 let client_media_ip = SipUri::from_str(&from).map(|uri| uri.host).unwrap_or_else(|_| src_addr.ip().to_string());
                 let client_rtp_target = format!("{}:{}", client_media_ip, client_media_port);
@@ -81,25 +80,37 @@ impl CallHandler {
                     
                     let mut media_client = { self.clients.lock().await.media.clone() };
                     
-                    // [CRITICAL FIX]: Warmer paketini SBC'ye gönder, Proxy'ye değil!
-                    let hole_punch_target = self.config.sbc_sip_addr.clone();
+                    // [CRITICAL FIX v1.3.6]: DNS Resolution before RPC
+                    // `media-service`'s `PlayAudio` RPC'si hostname çözümleyemez.
+                    // Bu yüzden B2BUA, RPC'yi çağırmadan önce adresi IP'ye çevirmek zorundadır.
+                    let hole_punch_target_addr = match lookup_host(&self.config.sbc_sip_addr).await {
+                        Ok(mut addrs) => {
+                            if let Some(addr) = addrs.next() {
+                                addr.to_string()
+                            } else {
+                                warn!("DNS resolution failed for {}. Falling back to src_addr.", self.config.sbc_sip_addr);
+                                src_addr.to_string()
+                            }
+                        },
+                        Err(e) => {
+                            warn!("DNS lookup error for {}: {}. Falling back to src_addr.", self.config.sbc_sip_addr, e);
+                            src_addr.to_string()
+                        }
+                    };
 
-                    info!("🔨 [HOLE-PUNCH] Sending warmer packet to SBC: {}", hole_punch_target);
+                    info!("🔨 [HOLE-PUNCH] Resolved SBC target: {}. Sending warmer packet.", hole_punch_target_addr);
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: hole_punch_target.clone(),
+                        rtp_target_addr: hole_punch_target_addr.clone(),
                     })).await;
 
-                    // Echo modunu başlatırken de hedef olarak SBC'yi göster.
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: hole_punch_target,
+                        rtp_target_addr: hole_punch_target_addr,
                     })).await;
                 }
-
-                // ... (200 OK gönderme ve Session oluşturma mantığı aynı) ...
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
