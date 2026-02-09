@@ -1,3 +1,4 @@
+// sentiric-b2bua-service/src/config.rs
 use anyhow::{Context, Result};
 use std::env;
 use std::net::SocketAddr;
@@ -25,6 +26,9 @@ pub struct AppConfig {
     // SIP Routing
     pub proxy_sip_addr: String, // Outbound çağrılar buraya gider
     
+    // [YENİ] Medya Hedefi
+    pub sbc_sip_addr: String, // Gelen çağrının medyası buraya geri döner
+    
     // Identity
     pub public_ip: String, 
     pub sip_realm: String,
@@ -50,9 +54,12 @@ impl AppConfig {
         let grpc_addr: SocketAddr = format!("[::]:{}", grpc_port).parse()?;
         let http_addr: SocketAddr = format!("[::]:{}", http_port).parse()?;
         
-        // Proxy'nin SIP adresi (Outbound için gateway)
         let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
             .unwrap_or_else(|_| "proxy-service:13074".to_string());
+
+        // [YENİ] SBC'nin adresini ortam değişkeninden alıyoruz.
+        let sbc_target = env::var("SBC_SERVICE_SIP_TARGET")
+            .context("ZORUNLU: SBC_SERVICE_SIP_TARGET (örn: sbc-service:13094)")?;
 
         let public_ip = env::var("SBC_SERVICE_PUBLIC_IP")
             .or_else(|_| env::var("PUBLIC_IP"))
@@ -66,6 +73,7 @@ impl AppConfig {
             sip_bind_ip: "0.0.0.0".to_string(),
             sip_port,
             proxy_sip_addr: proxy_target,
+            sbc_sip_addr: sbc_target, // [YENİ]
 
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),

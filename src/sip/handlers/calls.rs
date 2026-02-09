@@ -57,7 +57,6 @@ impl CallHandler {
             Ok(response) => {
                 let resolution = response.into_inner();
                 let action = resolution.action.as_ref().unwrap();
-                // [DÜZELTME]: Enum varyantı 'Unspecified' olarak kullanılıyor.
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
                 info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
@@ -70,40 +69,40 @@ impl CallHandler {
                         return;
                     }
                 };
+                
+                // [CRITICAL FIX]: Hedefi `src_addr` (Proxy'nin IP'si) yerine, SDP'den gelen gerçek müşteri IP'si olarak al.
+                // Bu, B2BUA'nın RabbitMQ'ya doğru bilgiyi basmasını sağlar.
+                let client_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(30000);
+                let client_media_ip = SipUri::from_str(&from).map(|uri| uri.host).unwrap_or_else(|_| src_addr.ip().to_string());
+                let client_rtp_target = format!("{}:{}", client_media_ip, client_media_port);
 
-                let sbc_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(30000);
-                let sbc_rtp_target = SocketAddr::new(src_addr.ip(), sbc_media_port);
-
-                // --- NATIVE TELECOM BRANCH: ECHO TEST ---
-                // [DÜZELTME]: Enum varyantı 'EchoTest' olarak kullanılıyor.
                 if action_type == ActionType::EchoTest {
-                    info!("🔊 [PBX-MODE] Activating Native Echo. Target: {}", sbc_rtp_target);
+                    info!("🔊 [PBX-MODE] Activating Native Echo. Target: {}", self.config.sbc_sip_addr);
                     
-                    let mut media_client = {
-                        let guard = self.clients.lock().await;
-                        guard.media.clone()
-                    };
+                    let mut media_client = { self.clients.lock().await.media.clone() };
                     
-                    // 1. Hole Punching (Tünel Açma)
-                    info!("🔨 [HOLE-PUNCH] Sending warmer packet to open SBC latch.");
+                    // [CRITICAL FIX]: Warmer paketini SBC'ye gönder, Proxy'ye değil!
+                    let hole_punch_target = self.config.sbc_sip_addr.clone();
+
+                    info!("🔨 [HOLE-PUNCH] Sending warmer packet to SBC: {}", hole_punch_target);
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: sbc_rtp_target.to_string(),
+                        rtp_target_addr: hole_punch_target.clone(),
                     })).await;
 
-                    // 2. Echo Modunu Başlat
+                    // Echo modunu başlatırken de hedef olarak SBC'yi göster.
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: sbc_rtp_target.to_string(),
+                        rtp_target_addr: hole_punch_target,
                     })).await;
                 }
 
-                // 200 OK & Handshake
+                // ... (200 OK gönderme ve Session oluşturma mantığı aynı) ...
+
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
-
                 let mut ok_resp = SipResponseFactory::create_200_ok(&req);
                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                     if !to_h.value.contains(";tag=") { to_h.value.push_str(&format!(";tag={}", local_tag)); }
@@ -128,9 +127,8 @@ impl CallHandler {
                 self.calls.insert(call_id.clone(), session);
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
-                    // [DÜZELTME]: Enum varyantı 'EchoTest' olarak kullanılıyor.
                     if action_type != ActionType::EchoTest {
-                        self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target.to_string(), &from, &to, Some(resolution)).await;
+                        self.event_mgr.publish_call_started(&call_id, rtp_port, &client_rtp_target, &from, &to, Some(resolution)).await;
                     }
                 }
             },
