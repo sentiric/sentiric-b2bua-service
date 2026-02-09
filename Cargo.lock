@@ -2388,8 +2388,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-rtp-core"
-version = "1.3.4"
-source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.3.4#226696e903e38ff06fc41b88920d46ca7a889aff"
+version = "1.3.5"
+source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.3.5#e13a0e62c5ffbc5d403293f0ac4b022e75264d47"
 dependencies = [
  "cc",
  "glob",

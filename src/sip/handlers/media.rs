@@ -43,15 +43,16 @@ impl MediaManager {
         tokio::spawn(async move { let _ = media_client.release_port(ReleasePortRequest { rtp_port: port }).await; });
     }
 
-    /// [v1.4.2 MİMARİ]: CODEC PRIORITY OVERRIDE
-    /// G.729 (18) yerine PCMA (8) en başa çekildi. Bu, ses kalitesini artırır ve 
-    /// Media Service üzerindeki CPU yükünü (transcoding ihtiyacını) azaltır.
+    /// [v1.4.3 MİMARİ GÜNCELLEMESİ]: CODEC PRIORITIES
+    /// Kullanıcı İsteği: G.729 en başta (Primary).
+    /// Sıralama: G.729 > PCMU > PCMA (Cızırtı riski nedeniyle en son)
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
         SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
-            .add_codec(8, "PCMA", 8000, None)   // Lossless Narrowband (Zorunlu)
-            .add_codec(0, "PCMU", 8000, None)   // Lossless Narrowband (Zorunlu)
-            .add_codec(18, "G729", 8000, Some("annexb=no")) // Compressed (Opsiyonel)
-            .add_codec(101, "telephone-event", 8000, Some("0-16")) // DTMF Support
+            .add_codec(18, "G729", 8000, Some("annexb=no")) // 1. TERCİH: Bandwidth Saver
+            .add_codec(0, "PCMU", 8000, None)   // 2. TERCİH: High Quality / Safe
+            // PCMA (Cızırtı )
+            .add_codec(8, "PCMA", 8000, None)   // 3. TERCİH: Europe Standard
+            .add_codec(101, "telephone-event", 8000, Some("0-16")) // DTMF
             .build()
             .as_bytes()
             .to_vec()
