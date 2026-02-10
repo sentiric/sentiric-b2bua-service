@@ -47,20 +47,24 @@ impl MediaManager {
     /// Telekom standartlarına uyum için 20ms paketleme zorlanıyor.
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
         SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
-            // 1. TERCİH: Bandwidth Saver
-            .add_codec(18, "G729", 8000, Some("annexb=no")) 
-            // 2. TERCİH: High Quality / Safe
-            .add_codec(0, "PCMU", 8000, None)   
-            // 3. TERCİH: Europe Standard
-            .add_codec(8, "PCMA", 8000, None)   
-            // DTMF
-            .add_codec(101, "telephone-event", 8000, Some("0-16")) 
-            // [CRITICAL FIX] Ptime: 20ms (Media Service ile senkronize)
-            .with_ptime(20) 
-            // RTCP Muxing garantisi olmadığı için ayrı port ilanı güvenlidir
-            .with_rtcp(true)
+            // [FIX 1] Öncelik PCMU (0) yapıldı. Media Service default PCMU kullanıyor.
+            // Bu sayede sinyalleşme ve medya aynı dili konuşacak.
+            .add_codec(0, "PCMU", 8000, None)
+            
+            // Yedekler
+            .add_codec(18, "G729", 8000, Some("annexb=no"))
+            .add_codec(8, "PCMA", 8000, None) // CIZIRTILI
+            .add_codec(101, "telephone-event", 8000, Some("0-16"))
+            
+            // Standart Ptime
+            .with_ptime(20)
+            
+            // [FIX 2] RTCP Kapalı.
+            // NAT arkasındaki port eşleşme riskini sıfıra indirmek için.
+            // Sadece tek bir port (RTP) üzerinden iletişim kurulsun.
+            .with_rtcp(false)
+            
             .build()
             .as_bytes()
             .to_vec()
-    }
 }
