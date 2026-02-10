@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tokio::net::lookup_host; // DNS ÇÖZÜMLEME İÇİN EKLENDİ
-use tracing::{info, error, warn}; // WARN EKLENDİ
+use tokio::net::lookup_host;
+use tracing::{info, error, warn};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -40,6 +40,7 @@ impl CallHandler {
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
         
+        // Dialplan logic
         let to_uri = SipUri::from_str(&to).unwrap_or_else(|_| SipUri::from_str("sip:unknown@sentiric.local").unwrap());
         let to_aor = to_uri.user.unwrap_or_default();
 
@@ -56,11 +57,13 @@ impl CallHandler {
 
         match dialplan_res {
             Ok(response) => {
+                // Dialplan response parsing
                 let resolution = response.into_inner();
                 let action = resolution.action.as_ref().unwrap();
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
                 info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
+
 
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
@@ -71,34 +74,33 @@ impl CallHandler {
                     }
                 };
                 
-                let client_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(30000);
-                let client_media_ip = SipUri::from_str(&from).map(|uri| uri.host).unwrap_or_else(|_| src_addr.ip().to_string());
-                let client_rtp_target = format!("{}:{}", client_media_ip, client_media_port);
+                // [CRITICAL FIX v1.3.7]: `src_addr` yerine, SIP paketinin SDP ve Via/Contact başlıklarından
+                // gerçek medya hedefini çıkarıyoruz.
+                let sdp_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(7000); // Baresip'in varsayılanı
+                let sdp_media_ip = SipUri::from_str(&from).map(|uri| uri.host).unwrap_or_else(|_| src_addr.ip().to_string());
+                let client_rtp_target = format!("{}:{}", sdp_media_ip, sdp_media_port);
 
                 if action_type == ActionType::EchoTest {
-                    info!("🔊 [PBX-MODE] Activating Native Echo. Target: {}", self.config.sbc_sip_addr);
-                    
                     let mut media_client = { self.clients.lock().await.media.clone() };
                     
-                    // [CRITICAL FIX v1.3.6]: DNS Resolution before RPC
-                    // `media-service`'s `PlayAudio` RPC'si hostname çözümleyemez.
-                    // Bu yüzden B2BUA, RPC'yi çağırmadan önce adresi IP'ye çevirmek zorundadır.
+                    // [NİHAİ DÜZELTME]: Sinyalden gelen IP'yi al, Medyadan gelen PORT'u al.
                     let hole_punch_target_addr = match lookup_host(&self.config.sbc_sip_addr).await {
                         Ok(mut addrs) => {
-                            if let Some(addr) = addrs.next() {
-                                addr.to_string()
+                            if let Some(resolved_addr) = addrs.next() {
+                                // DNS'ten IP'yi al, AMA port olarak INVITE içindeki `m=` satırını kullan.
+                                SocketAddr::new(resolved_addr.ip(), sdp_media_port).to_string()
                             } else {
-                                warn!("DNS resolution failed for {}. Falling back to src_addr.", self.config.sbc_sip_addr);
-                                src_addr.to_string()
+                                warn!("DNS resolution for SBC failed. Falling back to client RTP target.");
+                                client_rtp_target.clone()
                             }
                         },
-                        Err(e) => {
-                            warn!("DNS lookup error for {}: {}. Falling back to src_addr.", self.config.sbc_sip_addr, e);
-                            src_addr.to_string()
+                        Err(_) => {
+                            warn!("DNS lookup error for SBC. Falling back to client RTP target.");
+                            client_rtp_target.clone()
                         }
                     };
 
-                    info!("🔨 [HOLE-PUNCH] Resolved SBC target: {}. Sending warmer packet.", hole_punch_target_addr);
+                    info!("🔨 [HOLE-PUNCH] Resolved SBC Target: {}. Sending warmer packet.", hole_punch_target_addr);
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
                         server_rtp_port: rtp_port,
@@ -112,6 +114,7 @@ impl CallHandler {
                     })).await;
                 }
 
+                // 200 OK ve Session oluşturma mantığı
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
                 let mut ok_resp = SipResponseFactory::create_200_ok(&req);
