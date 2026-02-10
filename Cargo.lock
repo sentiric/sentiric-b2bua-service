@@ -2350,7 +2350,7 @@ checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
 name = "sentiric-b2bua-service"
-version = "1.4.3"
+version = "1.4.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2388,8 +2388,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-rtp-core"
-version = "1.3.5"
-source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.3.5#e13a0e62c5ffbc5d403293f0ac4b022e75264d47"
+version = "1.3.6"
+source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.3.6#e9182255d7b267273832066f129f8f0b6c31f603"
 dependencies = [
  "cc",
  "glob",
@@ -2400,8 +2400,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-sip-core"
-version = "1.4.2"
-source = "git+https://github.com/sentiric/sentiric-sip-core.git?tag=v1.4.2#85cd3c3ac551385d30764ade570e4a6052f6c112"
+version = "1.4.3"
+source = "git+https://github.com/sentiric/sentiric-sip-core.git?tag=v1.4.3#d989706845d8d0b08a5d4806c8aa6b6ff722525c"
 dependencies = [
  "once_cell",
  "regex",

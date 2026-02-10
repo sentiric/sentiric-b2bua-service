@@ -6,7 +6,7 @@ use tonic::Request;
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest};
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
-use sentiric_sip_core::sdp::SdpBuilder;
+use sentiric_sip_core::sdp::SdpBuilder; // Core'dan gelen Builder
 use tokio::time::{timeout, Duration};
 
 pub struct MediaManager {
@@ -43,16 +43,22 @@ impl MediaManager {
         tokio::spawn(async move { let _ = media_client.release_port(ReleasePortRequest { rtp_port: port }).await; });
     }
 
-    /// [v1.4.3 MİMARİ GÜNCELLEMESİ]: CODEC PRIORITIES
-    /// Kullanıcı İsteği: G.729 en başta (Primary).
-    /// Sıralama: G.729 > PCMU > PCMA (Cızırtı riski nedeniyle en son)
+    /// [v1.4.4 GÜNCELLEMESİ]: Explicit Ptime Configuration
+    /// Telekom standartlarına uyum için 20ms paketleme zorlanıyor.
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
         SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
-            .add_codec(18, "G729", 8000, Some("annexb=no")) // 1. TERCİH: Bandwidth Saver
-            .add_codec(0, "PCMU", 8000, None)   // 2. TERCİH: High Quality / Safe
-            // PCMA (Cızırtı )
-            .add_codec(8, "PCMA", 8000, None)   // 3. TERCİH: Europe Standard
-            .add_codec(101, "telephone-event", 8000, Some("0-16")) // DTMF
+            // 1. TERCİH: Bandwidth Saver
+            .add_codec(18, "G729", 8000, Some("annexb=no")) 
+            // 2. TERCİH: High Quality / Safe
+            .add_codec(0, "PCMU", 8000, None)   
+            // 3. TERCİH: Europe Standard
+            .add_codec(8, "PCMA", 8000, None)   
+            // DTMF
+            .add_codec(101, "telephone-event", 8000, Some("0-16")) 
+            // [CRITICAL FIX] Ptime: 20ms (Media Service ile senkronize)
+            .with_ptime(20) 
+            // RTCP Muxing garantisi olmadığı için ayrı port ilanı güvenlidir
+            .with_rtcp(true)
             .build()
             .as_bytes()
             .to_vec()
