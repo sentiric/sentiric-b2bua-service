@@ -4,7 +4,7 @@ use crate::grpc::service::MyB2BuaService;
 use crate::grpc::client::InternalClients;
 use crate::tls::load_server_tls_config;
 use crate::sip::engine::B2BuaEngine;
-use crate::sip::state::new_store;
+use crate::sip::store::CallStore; // DÜZELTME: state::new_store yerine store::CallStore
 use crate::sip::server::SipServer;
 use crate::rabbitmq::RabbitMqClient;
 use anyhow::{Context, Result};
@@ -21,7 +21,7 @@ use hyper::{
     Body, Request, Response, Server as HttpServer, StatusCode,
 };
 use sentiric_sip_core::SipTransport;
-use std::time::Duration; // YENİ EKLENDİ
+use std::time::Duration;
 
 pub struct App {
     config: Arc<AppConfig>,
@@ -64,9 +64,8 @@ impl App {
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
 
-        // --- KRİTİK DEĞİŞİKLİK: DAYANIKLI BAĞLANTI DÖNGÜSÜ ---
+        // 1. Giden Bağlantılar (Retry Loop ile)
         let clients = loop {
-            // Kapatma sinyali gelirse hemen çık
             tokio::select! {
                 biased;
                 _ = shutdown_rx.recv() => {
@@ -87,16 +86,18 @@ impl App {
                 }
             }
         };
-        // --- KRİTİK DEĞİŞİKLİK BİTTİ ---
 
-        let calls = new_store();
+        // 2. Redis Call Store (YENİ - Persistence)
+        info!("Redis Store başlatılıyor: {}", self.config.redis_url);
+        let calls = CallStore::new(&self.config.redis_url).await
+            .context("Call Store (Redis) başlatılamadı")?;
 
-        // 2. RabbitMQ
+        // 3. RabbitMQ
         info!("RabbitMQ'ya bağlanılıyor: {}", self.config.rabbitmq_url);
         let rabbitmq_client = Arc::new(RabbitMqClient::new(&self.config.rabbitmq_url).await
             .context("RabbitMQ bağlantısı başarısız")?);
 
-        // 3. SIP Transport & Engine
+        // 4. SIP Transport & Engine
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
         let transport = Arc::new(SipTransport::new(&bind_addr).await?);
         
@@ -108,13 +109,13 @@ impl App {
             rabbitmq_client
         ));
 
-        // 4. SIP Server
+        // 5. SIP Server
         let sip_server = SipServer::new(engine.clone(), transport);
         let sip_handle = tokio::spawn(async move {
             sip_server.run(sip_shutdown_rx).await;
         });
 
-        // 5. gRPC Server
+        // 6. gRPC Server
         let grpc_config = self.config.clone();
         let grpc_server_handle = tokio::spawn(async move {
             let tls_config = load_server_tls_config(&grpc_config).await.expect("TLS hatası");
@@ -132,7 +133,7 @@ impl App {
                 .context("gRPC sunucusu çöktü")
         });
 
-        // 6. HTTP Server
+        // 7. HTTP Server
         let http_config = self.config.clone();
         let http_server_handle = tokio::spawn(async move {
             let addr = http_config.http_listen_addr;

@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-b2bua-service"
-version = "1.4.6"
+version = "1.4.7" # Patch bump
 edition = "2021"
 
 [dependencies]
@@ -25,9 +25,12 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 dashmap = "5.5"
 lapin = "2.3.1"
+# Redis ve Serde eklendi
 redis = { version = "0.26", features = ["tokio-rustls-comp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
-# --- THE IRON CORE (STABLE/UPDATED) ---
-sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.3.8" }
+# --- THE IRON CORE (UPDATED) ---
+sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.4.1" }
 sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.4.3" }
 sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.16.0" }

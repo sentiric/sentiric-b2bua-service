@@ -13,7 +13,7 @@ use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionT
 use sentiric_contracts::sentiric::media::v1::PlayAudioRequest;
 use tonic::Request;
 use crate::config::AppConfig;
-use crate::sip::state::{CallStore, CallSession, CallState};
+use crate::sip::store::{CallStore, CallSession, CallSessionData, CallState}; // Store importları
 use crate::grpc::client::InternalClients;
 use crate::sip::handlers::media::MediaManager;
 use crate::sip::handlers::events::EventManager;
@@ -111,10 +111,19 @@ impl CallHandler {
                 let mut tx = SipTransaction::new(&req).unwrap();
                 tx.update_with_response(&ok_resp);
 
-                self.calls.insert(call_id.clone(), CallSession {
-                    call_id: call_id.clone(), state: CallState::Established, from_uri: from.clone(), to_uri: to.clone(),
-                    rtp_port, local_tag, endpoint: sentiric_rtp_core::RtpEndpoint::new(None), active_transaction: Some(tx),
-                });
+                // YENİ: CallSession oluştururken Data struct kullanılıyor
+                let session_data = CallSessionData {
+                    call_id: call_id.clone(),
+                    state: CallState::Established,
+                    from_uri: from.clone(),
+                    to_uri: to.clone(),
+                    rtp_port,
+                    local_tag,
+                };
+                let mut session = CallSession::new(session_data);
+                session.active_transaction = Some(tx);
+
+                self.calls.insert(session).await; // Async insert
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
@@ -138,10 +147,18 @@ impl CallHandler {
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
         invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         invite.body = sdp_body;
-        self.calls.insert(call_id.to_string(), CallSession {
-            call_id: call_id.to_string(), state: CallState::Trying, from_uri: from_uri.to_string(), to_uri: to_uri.to_string(),
-            rtp_port, local_tag, endpoint: sentiric_rtp_core::RtpEndpoint::new(None), active_transaction: None,
-        });
+
+        // YENİ: CallSession oluşturma
+        let session_data = CallSessionData {
+            call_id: call_id.to_string(),
+            state: CallState::Trying,
+            from_uri: from_uri.to_string(),
+            to_uri: to_uri.to_string(),
+            rtp_port,
+            local_tag,
+        };
+        self.calls.insert(CallSession::new(session_data)).await;
+
         let proxy_addr: SocketAddr = self.config.proxy_sip_addr.parse()?;
         transport.send(&invite.to_bytes(), proxy_addr).await?;
         Ok(())
@@ -150,13 +167,15 @@ impl CallHandler {
     pub async fn process_bye(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
-        if let Some((_, session)) = self.calls.remove(&call_id) {
-            self.media_mgr.release_port(session.rtp_port).await;
+        
+        // YENİ: Async remove ve data erişimi
+        if let Some(session) = self.calls.remove(&call_id).await {
+            self.media_mgr.release_port(session.data.rtp_port).await;
             self.event_mgr.publish_call_ended(&call_id).await;
         }
     }
 
     pub async fn process_ack(&self, call_id: &str) {
-        if let Some(mut s) = self.calls.get_mut(call_id) { s.state = CallState::Established; }
+        self.calls.update_state(call_id, CallState::Established).await;
     }
 }
