@@ -67,4 +67,5 @@ impl MediaManager {
             .build()
             .as_bytes()
             .to_vec()
+    }
 }
