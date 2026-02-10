@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-b2bua-service"
-version = "1.4.4" # Versiyon artırıldı (Ptime Alignment)
+version = "1.4.6"
 edition = "2021"
 
 [dependencies]
@@ -27,7 +27,7 @@ dashmap = "5.5"
 lapin = "2.3.1"
 redis = { version = "0.26", features = ["tokio-rustls-comp"] }
 
-# --- THE IRON CORE ---
-sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.3.6" }
+# --- THE IRON CORE (STABLE/UPDATED) ---
+sentiric-rtp-core = { git = "https://github.com/sentiric/sentiric-rtp-core.git", tag = "v1.3.8" }
 sentiric-sip-core = { git = "https://github.com/sentiric/sentiric-sip-core.git", tag = "v1.4.3" }
 sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.16.0" }

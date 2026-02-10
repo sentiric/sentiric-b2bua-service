@@ -6,7 +6,8 @@ use tonic::Request;
 use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRequest};
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
-use sentiric_sip_core::sdp::SdpBuilder; // Core'dan gelen Builder
+use sentiric_sip_core::sdp::SdpBuilder;
+use sentiric_rtp_core::AudioProfile; // Otoriteyi import et
 use tokio::time::{timeout, Duration};
 
 pub struct MediaManager {
@@ -19,6 +20,7 @@ impl MediaManager {
         Self { clients, config }
     }
 
+    // allocate_port, release_port, extract_port_from_sdp metodları aynı kalıyor...
     pub fn extract_port_from_sdp(&self, body: &[u8]) -> Option<u16> {
         let sdp_text = String::from_utf8_lossy(body);
         for line in sdp_text.lines() {
@@ -43,29 +45,28 @@ impl MediaManager {
         tokio::spawn(async move { let _ = media_client.release_port(ReleasePortRequest { rtp_port: port }).await; });
     }
 
-    /// [v1.4.4 GÜNCELLEMESİ]: Explicit Ptime Configuration
-    /// Telekom standartlarına uyum için 20ms paketleme zorlanıyor.
+    /// [v1.4.6 GÜNCELLEMESİ]: Centralized Audio Profile
+    /// Artık kodek listesi ve sırası tamamen rtp-core/config.rs içinden gelir.
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
-        SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
-            // [FIX 1] Öncelik PCMU (0) yapıldı. Media Service default PCMU kullanıyor.
-            // Bu sayede sinyalleşme ve medya aynı dili konuşacak.
-            .add_codec(0, "PCMU", 8000, None)
-            
-            // Yedekler
-            .add_codec(18, "G729", 8000, Some("annexb=no"))
-            .add_codec(8, "PCMA", 8000, None) // CIZIRTILI
-            .add_codec(101, "telephone-event", 8000, Some("0-16"))
-            
-            // Standart Ptime
-            .with_ptime(20)
-            
-            // [FIX 2] RTCP Kapalı.
-            // NAT arkasındaki port eşleşme riskini sıfıra indirmek için.
-            // Sadece tek bir port (RTP) üzerinden iletişim kurulsun.
-            .with_rtcp(false)
-            
-            .build()
-            .as_bytes()
-            .to_vec()
+        // 1. Otoriteden (rtp-core) Anayasayı al.
+        let profile = AudioProfile::default();
+        
+        // 2. SDP Matbaasını (sip-core) başlat.
+        let mut builder = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
+            .with_ptime(profile.ptime)
+            .with_rtcp(false); // NAT sorunlarını önlemek için RTCP attribute'unu kapatıyoruz.
+
+        // 3. Anayasadaki tüm kodekleri (ses + DTMF) sırasıyla SDP'ye ekle.
+        for codec_conf in profile.codecs {
+            builder = builder.add_codec(
+                codec_conf.payload_type, 
+                codec_conf.name, 
+                codec_conf.rate, 
+                codec_conf.fmtp
+            );
+        }
+        
+        // 4. SDP metnini oluştur.
+        builder.build().as_bytes().to_vec()
     }
 }
