@@ -24,10 +24,11 @@ pub struct AppConfig {
     pub redis_url: String,
     
     // SIP Routing
-    pub proxy_sip_addr: String, // Outbound çağrılar buraya gider
+    pub proxy_sip_addr: String,
     
-    // [YENİ] Medya Hedefi
-    pub sbc_sip_addr: String, // Gelen çağrının medyası buraya geri döner
+    // [GÜNCELLENDİ] Medya Hedefi
+    pub sbc_sip_addr: String,
+    pub sbc_public_ip: String, // SBC'nin dış IP'si
     
     // Identity
     pub public_ip: String, 
@@ -57,14 +58,12 @@ impl AppConfig {
         let proxy_target = env::var("PROXY_SERVICE_SIP_TARGET")
             .unwrap_or_else(|_| "proxy-service:13074".to_string());
 
-        // [YENİ] SBC'nin adresini ortam değişkeninden alıyoruz.
         let sbc_target = env::var("SBC_SERVICE_SIP_TARGET")
-            .context("ZORUNLU: SBC_SERVICE_SIP_TARGET (örn: sbc-service:13094)")?;
-
-        let public_ip = env::var("SBC_SERVICE_PUBLIC_IP")
-            .or_else(|_| env::var("PUBLIC_IP"))
-            .or_else(|_| env::var("NODE_IP")) 
-            .context("ZORUNLU: Public IP (NODE_IP veya PUBLIC_IP) tanımlanmalı")?;
+            .context("ZORUNLU: SBC_SERVICE_SIP_TARGET")?;
+            
+        // [YENİ] SBC'nin dış IP'sini de alıyoruz. Bu, B2BUA'nın kendisinin public_ip'si ile aynı olmalı.
+        let sbc_public_ip = env::var("SBC_SERVICE_PUBLIC_IP")
+            .context("ZORUNLU: SBC_SERVICE_PUBLIC_IP")?;
 
         Ok(AppConfig {
             grpc_listen_addr: grpc_addr,
@@ -73,7 +72,8 @@ impl AppConfig {
             sip_bind_ip: "0.0.0.0".to_string(),
             sip_port,
             proxy_sip_addr: proxy_target,
-            sbc_sip_addr: sbc_target, // [YENİ]
+            sbc_sip_addr: sbc_target,
+            sbc_public_ip: sbc_public_ip.clone(), // Kendi public IP'si ile aynı.
 
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),
@@ -84,12 +84,12 @@ impl AppConfig {
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             redis_url: env::var("REDIS_URL").context("ZORUNLU: REDIS_URL")?,
             
-            public_ip,
+            public_ip: sbc_public_ip, // Kendi Public IP'sini de buradan alıyor.
             sip_realm: env::var("SIP_SIGNALING_SERVICE_REALM").unwrap_or_else(|_| "sentiric_demo".to_string()),
 
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
             rust_log: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-            service_version: env::var("SERVICE_VERSION").unwrap_or_else(|_| "1.3.0".to_string()),
+            service_version: env::var("SERVICE_VERSION").unwrap_or_else(|_| "1.4.3".to_string()), // Versiyonu güncelleyelim
             
             cert_path: env::var("B2BUA_SERVICE_CERT_PATH").context("ZORUNLU: B2BUA_SERVICE_CERT_PATH")?,
             key_path: env::var("B2BUA_SERVICE_KEY_PATH").context("ZORUNLU: B2BUA_SERVICE_KEY_PATH")?,

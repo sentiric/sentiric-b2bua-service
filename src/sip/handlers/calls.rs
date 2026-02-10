@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tokio::net::lookup_host;
 use tracing::{info, error, warn};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
@@ -35,18 +34,42 @@ impl CallHandler {
         Self { config, clients, calls, media_mgr, event_mgr }
     }
 
+    /// SDP'den Bağlantı Adresini (c=) ve Medya Portunu (m=audio) ayıklar.
+    fn extract_rtp_target_from_sdp(&self, body: &[u8]) -> Option<String> {
+        let sdp_str = String::from_utf8_lossy(body);
+        let mut ip = String::new();
+        let mut port = 0u16;
+
+        for line in sdp_str.lines() {
+            if line.starts_with("c=IN IP4 ") {
+                ip = line[9..].trim().to_string();
+            } else if line.starts_with("m=audio ") {
+                if let Some(p_str) = line.split_whitespace().nth(1) {
+                    port = p_str.parse().unwrap_or(0);
+                }
+            }
+        }
+
+        if !ip.is_empty() && port > 0 {
+            Some(format!("{}:{}", ip, port))
+        } else {
+            None
+        }
+    }
+
     pub async fn process_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         let from = req.get_header_value(HeaderName::From).cloned().unwrap_or_default();
         let to = req.get_header_value(HeaderName::To).cloned().unwrap_or_default();
         
-        // Dialplan logic
         let to_uri = SipUri::from_str(&to).unwrap_or_else(|_| SipUri::from_str("sip:unknown@sentiric.local").unwrap());
         let to_aor = to_uri.user.unwrap_or_default();
 
+        // 1. Trying Gönder
         let trying = SipResponseFactory::create_100_trying(&req);
         let _ = transport.send(&trying.to_bytes(), src_addr).await;
 
+        // 2. Dialplan Sorgusu
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             clients.dialplan.resolve_dialplan(Request::new(ResolveDialplanRequest {
@@ -57,14 +80,13 @@ impl CallHandler {
 
         match dialplan_res {
             Ok(response) => {
-                // Dialplan response parsing
                 let resolution = response.into_inner();
                 let action = resolution.action.as_ref().unwrap();
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
                 info!("🧠 [DIALPLAN] Decision: {:?} for Call {}", action_type, call_id);
 
-
+                // 3. Media Service'ten Port Al
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -73,50 +95,44 @@ impl CallHandler {
                         return;
                     }
                 };
-                
-                // [CRITICAL FIX v1.3.7]: `src_addr` yerine, SIP paketinin SDP ve Via/Contact başlıklarından
-                // gerçek medya hedefini çıkarıyoruz.
-                let sdp_media_port = self.media_mgr.extract_port_from_sdp(&req.body).unwrap_or(7000); // Baresip'in varsayılanı
-                let sdp_media_ip = SipUri::from_str(&from).map(|uri| uri.host).unwrap_or_else(|_| src_addr.ip().to_string());
-                let client_rtp_target = format!("{}:{}", sdp_media_ip, sdp_media_port);
 
+                // [NİHAİ DÜZELTME]: Hedef Analizi
+                // Gelen paketin SDP'sindeki IP ve Port, SBC tarafından rewrite edilmiştir.
+                // Bu adres, SBC'nin bizimle (Internal) konuşmak için açtığı adrestir.
+                // Medya servisine "Sesi buraya gönder" demeliyiz.
+                let sbc_rtp_target = self.extract_rtp_target_from_sdp(&req.body)
+                    .unwrap_or_else(|| {
+                        // Fallback: SDP bozuksa paketin geldiği IP'yi ve varsayılan bir portu kullan
+                        warn!("⚠️ SDP parsing failed. Using source IP fallback.");
+                        format!("{}:{}", src_addr.ip(), 30000) 
+                    });
+
+                // --- Echo Test Logic ---
                 if action_type == ActionType::EchoTest {
+                    info!("🔊 [PBX-MODE] Activating Native Echo. Target: {}", sbc_rtp_target);
+                    
                     let mut media_client = { self.clients.lock().await.media.clone() };
                     
-                    // [NİHAİ DÜZELTME]: Sinyalden gelen IP'yi al, Medyadan gelen PORT'u al.
-                    let hole_punch_target_addr = match lookup_host(&self.config.sbc_sip_addr).await {
-                        Ok(mut addrs) => {
-                            if let Some(resolved_addr) = addrs.next() {
-                                // DNS'ten IP'yi al, AMA port olarak INVITE içindeki `m=` satırını kullan.
-                                SocketAddr::new(resolved_addr.ip(), sdp_media_port).to_string()
-                            } else {
-                                warn!("DNS resolution for SBC failed. Falling back to client RTP target.");
-                                client_rtp_target.clone()
-                            }
-                        },
-                        Err(_) => {
-                            warn!("DNS lookup error for SBC. Falling back to client RTP target.");
-                            client_rtp_target.clone()
-                        }
-                    };
-
-                    info!("🔨 [HOLE-PUNCH] Resolved SBC Target: {}. Sending warmer packet.", hole_punch_target_addr);
+                    // 1. Hole Punching (SBC'ye doğru)
+                    info!("🔨 [HOLE-PUNCH] Sending warmer packet to SBC: {}", sbc_rtp_target);
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: hole_punch_target_addr.clone(),
+                        rtp_target_addr: sbc_rtp_target.clone(),
                     })).await;
 
+                    // 2. Echo Modunu Başlat
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port,
-                        rtp_target_addr: hole_punch_target_addr,
+                        rtp_target_addr: sbc_rtp_target.clone(), // Clone gerekli
                     })).await;
                 }
 
-                // 200 OK ve Session oluşturma mantığı
+                // 4. 200 OK & Handshake
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
+
                 let mut ok_resp = SipResponseFactory::create_200_ok(&req);
                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
                     if !to_h.value.contains(";tag=") { to_h.value.push_str(&format!(";tag={}", local_tag)); }
@@ -142,7 +158,7 @@ impl CallHandler {
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
                     if action_type != ActionType::EchoTest {
-                        self.event_mgr.publish_call_started(&call_id, rtp_port, &client_rtp_target, &from, &to, Some(resolution)).await;
+                        self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
                     }
                 }
             },
