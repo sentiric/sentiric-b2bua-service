@@ -7,7 +7,7 @@ use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRe
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
 use sentiric_sip_core::sdp::SdpBuilder;
-use sentiric_rtp_core::AudioProfile; // Otoriteyi import et
+use sentiric_rtp_core::AudioProfile; // Otorite
 use tokio::time::{timeout, Duration};
 
 pub struct MediaManager {
@@ -20,7 +20,6 @@ impl MediaManager {
         Self { clients, config }
     }
 
-    // allocate_port, release_port, extract_port_from_sdp metodları aynı kalıyor...
     pub fn extract_port_from_sdp(&self, body: &[u8]) -> Option<u16> {
         let sdp_text = String::from_utf8_lossy(body);
         for line in sdp_text.lines() {
@@ -36,6 +35,7 @@ impl MediaManager {
         let mut media_client = { let guard = self.clients.lock().await; guard.media.clone() }; 
         let mut req = Request::new(AllocatePortRequest { call_id: call_id.to_string() });
         req.metadata_mut().insert("x-trace-id", call_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
+        
         let res = timeout(Duration::from_secs(3), media_client.allocate_port(req)).await?;
         Ok(res?.into_inner().rtp_port)
     }
@@ -45,24 +45,26 @@ impl MediaManager {
         tokio::spawn(async move { let _ = media_client.release_port(ReleasePortRequest { rtp_port: port }).await; });
     }
 
-    /// [v1.4.6 GÜNCELLEMESİ]: Centralized Audio Profile
-    /// Artık kodek listesi ve sırası tamamen rtp-core/config.rs içinden gelir.
+    /// Centralized Audio Profile (rtp-core v1.5.0)
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
         // 1. Otoriteden (rtp-core) Anayasayı al.
         let profile = AudioProfile::default();
         
         // 2. SDP Matbaasını (sip-core) başlat.
+        // NAT sorunlarını önlemek için RTCP attribute'unu genellikle açık tutuyoruz ama 
+        // bazı durumlarda (Symmetric RTP) kapatmak gerekebilir. 
+        // Şimdilik standart gereği true bırakıyoruz, sbc-service bunu rewrite edebilir.
         let mut builder = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
             .with_ptime(profile.ptime)
-            .with_rtcp(false); // NAT sorunlarını önlemek için RTCP attribute'unu kapatıyoruz.
+            .with_rtcp(true); 
 
-        // 3. Anayasadaki tüm kodekleri (ses + DTMF) sırasıyla SDP'ye ekle.
+        // 3. Anayasadaki tüm kodekleri sırasıyla ekle.
         for codec_conf in profile.codecs {
             builder = builder.add_codec(
                 codec_conf.payload_type, 
                 codec_conf.name, 
                 codec_conf.rate, 
-                codec_conf.fmtp
+                codec_conf.fmtp.as_deref()
             );
         }
         

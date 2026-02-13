@@ -10,12 +10,12 @@ use sentiric_sip_core::{
 };
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
-use crate::sip::store::CallStore; // Değişti
+use crate::sip::store::CallStore;
 use crate::rabbitmq::RabbitMqClient;
 use crate::sip::handlers::{media::MediaManager, events::EventManager, calls::CallHandler};
 
 pub struct B2BuaEngine {
-    calls: CallStore, // Tip değişti
+    calls: CallStore,
     transport: Arc<sentiric_sip_core::SipTransport>,
     call_handler: CallHandler,
 }
@@ -42,7 +42,6 @@ impl B2BuaEngine {
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         
-        // Store'dan async olarak çekiyoruz (Redis/RAM)
         let session_opt = self.calls.get(&call_id).await;
 
         let action = if let Some(session) = session_opt {
@@ -57,7 +56,8 @@ impl B2BuaEngine {
             },
             TransactionAction::Ignore => return,
             TransactionAction::ForwardToApp => {
-                if packet.is_request {
+                // [FIX]: is_request() helper kullanımı
+                if packet.is_request() {
                     match packet.method {
                         Method::Invite => self.call_handler.process_invite(self.transport.clone(), packet, src_addr).await,
                         Method::Ack => self.call_handler.process_ack(&call_id).await,
