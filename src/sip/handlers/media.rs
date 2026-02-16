@@ -7,7 +7,7 @@ use sentiric_contracts::sentiric::media::v1::{AllocatePortRequest, ReleasePortRe
 use crate::grpc::client::InternalClients;
 use crate::config::AppConfig;
 use sentiric_sip_core::sdp::SdpBuilder;
-use sentiric_rtp_core::AudioProfile; // Otorite
+use sentiric_rtp_core::AudioProfile; 
 use tokio::time::{timeout, Duration};
 
 pub struct MediaManager {
@@ -45,20 +45,15 @@ impl MediaManager {
         tokio::spawn(async move { let _ = media_client.release_port(ReleasePortRequest { rtp_port: port }).await; });
     }
 
-    /// Centralized Audio Profile (rtp-core v1.5.0)
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
-        // 1. Otoriteden (rtp-core) Anayasayı al.
         let profile = AudioProfile::default();
         
-        // 2. SDP Matbaasını (sip-core) başlat.
-        // NAT sorunlarını önlemek için RTCP attribute'unu genellikle açık tutuyoruz ama 
-        // bazı durumlarda (Symmetric RTP) kapatmak gerekebilir. 
-        // Şimdilik standart gereği true bırakıyoruz, sbc-service bunu rewrite edebilir.
+        // [CRITICAL FIX]: with_rtcp(false)
+        // RTCP portunu dinlemediğimiz için ilan etmiyoruz.
         let mut builder = SdpBuilder::new(self.config.public_ip.clone(), rtp_port as u16)
             .with_ptime(profile.ptime)
-            .with_rtcp(true); 
+            .with_rtcp(false); 
 
-        // 3. Anayasadaki tüm kodekleri sırasıyla ekle.
         for codec_conf in profile.codecs {
             builder = builder.add_codec(
                 codec_conf.payload_type, 
@@ -68,7 +63,6 @@ impl MediaManager {
             );
         }
         
-        // 4. SDP metnini oluştur.
         builder.build().as_bytes().to_vec()
     }
 }
