@@ -104,7 +104,11 @@ impl CallHandler {
                     if !to_h.value.contains(";tag=") { to_h.value.push_str(&format!(";tag={}", local_tag)); }
                 }
 
-                ok_resp.headers.push(Header::new(HeaderName::Contact, format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.sip_port)));
+                // [KRİTİK DÜZELTME]: Contact başlığı B2BUA'nın iç portunu (13084) değil, 
+                // SBC'nin dış IP'sini ve dış portunu (5060) ilan etmeli.
+                let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.public_sip_port);
+                ok_resp.headers.push(Header::new(HeaderName::Contact, contact_uri));
+                
                 ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                 ok_resp.body = sdp_body;
 

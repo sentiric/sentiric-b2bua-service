@@ -33,7 +33,9 @@ pub struct AppConfig {
     // Identity
     pub public_ip: String, 
     pub sip_realm: String,
-    
+    // [YENİ] Dış dünyadan görünen port (Genelde 5060)
+    pub public_sip_port: u16, 
+
     pub env: String,
     pub rust_log: String,
     pub service_version: String,
@@ -65,6 +67,11 @@ impl AppConfig {
         let sbc_public_ip = env::var("SBC_SERVICE_PUBLIC_IP")
             .context("ZORUNLU: SBC_SERVICE_PUBLIC_IP")?;
 
+        // [YENİ] Eğer belirtilmemişse 5060 varsayalım
+        let public_sip_port = env::var("SBC_ADVERTISED_PORT")
+            .unwrap_or_else(|_| "5060".to_string())
+            .parse::<u16>().unwrap_or(5060);
+
         Ok(AppConfig {
             grpc_listen_addr: grpc_addr,
             http_listen_addr: http_addr, 
@@ -85,6 +92,7 @@ impl AppConfig {
             redis_url: env::var("REDIS_URL").context("ZORUNLU: REDIS_URL")?,
             
             public_ip: sbc_public_ip, // Kendi Public IP'sini de buradan alıyor.
+            public_sip_port, // [EKLENDİ]
             sip_realm: env::var("SIP_SIGNALING_SERVICE_REALM").unwrap_or_else(|_| "sentiric_demo".to_string()),
 
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
