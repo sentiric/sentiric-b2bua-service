@@ -180,6 +180,7 @@ impl CallHandler {
     }
 
     pub async fn process_ack(&self, call_id: &str) {
+        info!("✅ [SIP] ACK Alındı! Çağrı diyalogu onaylandı: {}", call_id);
         self.calls.update_state(call_id, CallState::Established).await;
     }
 }
