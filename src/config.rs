@@ -72,6 +72,10 @@ impl AppConfig {
             .unwrap_or_else(|_| "5060".to_string())
             .parse::<u16>().unwrap_or(5060);
 
+        // [MİMARİ DÜZELTME]: B2BUA artık Public IP olarak kendi Node IP'sini kullanır.
+        // Böylece SBC, bu iç IP'yi görüp manipüle etmek zorunda kalır (Sızıntı biter).
+        let node_ip = env::var("NODE_IP").context("ZORUNLU: NODE_IP eksik")?;            
+
         Ok(AppConfig {
             grpc_listen_addr: grpc_addr,
             http_listen_addr: http_addr, 
@@ -91,7 +95,9 @@ impl AppConfig {
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             redis_url: env::var("REDIS_URL").context("ZORUNLU: REDIS_URL")?,
             
-            public_ip: sbc_public_ip, // Kendi Public IP'sini de buradan alıyor.
+            // public_ip: sbc_public_ip, // Kendi Public IP'sini de buradan alıyor.
+            public_ip: node_ip, // Artık SBC'nin Public IP'si değil, kendi iç IP'si!
+            
             public_sip_port, // [EKLENDİ]
             sip_realm: env::var("SIP_SIGNALING_SERVICE_REALM").unwrap_or_else(|_| "sentiric_demo".to_string()),
 
