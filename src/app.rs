@@ -4,7 +4,7 @@ use crate::grpc::service::MyB2BuaService;
 use crate::grpc::client::InternalClients;
 use crate::tls::load_server_tls_config;
 use crate::sip::engine::B2BuaEngine;
-use crate::sip::store::CallStore; // DÜZELTME: state::new_store yerine store::CallStore
+use crate::sip::store::CallStore;
 use crate::sip::server::SipServer;
 use crate::rabbitmq::RabbitMqClient;
 use anyhow::{Context, Result};
@@ -44,20 +44,23 @@ impl App {
         let env_filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(&rust_log_env))?;
         let subscriber = Registry::default().with(env_filter);
         
-        if config.env == "development" {
-            subscriber.with(fmt::layer().with_target(true).with_line_number(true)).init();
+        // [GÜNCELLENDİ] JSON Loglama
+        if config.log_format == "json" {
+            subscriber.with(fmt::layer().json().flatten_event(true)).init();
         } else {
-            subscriber.with(fmt::layer().json().with_current_span(true).with_span_list(true)).init();
+            subscriber.with(fmt::layer().compact()).init();
         }
 
         info!(
             service_name = "sentiric-b2bua-service",
             version = %config.service_version,
             profile = %config.env,
+            log_format = %config.log_format,
             "🚀 Servis başlatılıyor..."
         );
         Ok(Self { config })
     }
+    
 
     pub async fn run(self) -> Result<()> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
@@ -87,7 +90,7 @@ impl App {
             }
         };
 
-        // 2. Redis Call Store (YENİ - Persistence)
+        // 2. Redis Call Store
         info!("Redis Store başlatılıyor: {}", self.config.redis_url);
         let calls = CallStore::new(&self.config.redis_url).await
             .context("Call Store (Redis) başlatılamadı")?;

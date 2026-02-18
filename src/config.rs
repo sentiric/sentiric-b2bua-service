@@ -26,18 +26,18 @@ pub struct AppConfig {
     // SIP Routing
     pub proxy_sip_addr: String,
     
-    // [GÜNCELLENDİ] Medya Hedefi
+    // Medya Hedefi
     pub sbc_sip_addr: String,
-    pub sbc_public_ip: String, // SBC'nin dış IP'si
+    pub sbc_public_ip: String, 
     
     // Identity
     pub public_ip: String, 
     pub sip_realm: String,
-    // [YENİ] Dış dünyadan görünen port (Genelde 5060)
     pub public_sip_port: u16, 
 
     pub env: String,
     pub rust_log: String,
+    pub log_format: String, // [YENİ]
     pub service_version: String,
     
     // Security
@@ -63,17 +63,13 @@ impl AppConfig {
         let sbc_target = env::var("SBC_SERVICE_SIP_TARGET")
             .context("ZORUNLU: SBC_SERVICE_SIP_TARGET")?;
             
-        // [YENİ] SBC'nin dış IP'sini de alıyoruz. Bu, B2BUA'nın kendisinin public_ip'si ile aynı olmalı.
         let sbc_public_ip = env::var("SBC_SERVICE_PUBLIC_IP")
             .context("ZORUNLU: SBC_SERVICE_PUBLIC_IP")?;
 
-        // [YENİ] Eğer belirtilmemişse 5060 varsayalım
         let public_sip_port = env::var("SBC_ADVERTISED_PORT")
             .unwrap_or_else(|_| "5060".to_string())
             .parse::<u16>().unwrap_or(5060);
 
-        // [MİMARİ DÜZELTME]: B2BUA artık Public IP olarak kendi Node IP'sini kullanır.
-        // Böylece SBC, bu iç IP'yi görüp manipüle etmek zorunda kalır (Sızıntı biter).
         let node_ip = env::var("NODE_IP").context("ZORUNLU: NODE_IP eksik")?;            
 
         Ok(AppConfig {
@@ -84,7 +80,7 @@ impl AppConfig {
             sip_port,
             proxy_sip_addr: proxy_target,
             sbc_sip_addr: sbc_target,
-            sbc_public_ip: sbc_public_ip.clone(), // Kendi public IP'si ile aynı.
+            sbc_public_ip: sbc_public_ip.clone(), 
 
             media_service_url: env::var("MEDIA_SERVICE_TARGET_GRPC_URL").context("ZORUNLU: MEDIA_SERVICE_TARGET_GRPC_URL")?,
             proxy_service_url: env::var("PROXY_SERVICE_TARGET_GRPC_URL").unwrap_or_default(),
@@ -95,15 +91,15 @@ impl AppConfig {
             rabbitmq_url: env::var("RABBITMQ_URL").context("ZORUNLU: RABBITMQ_URL")?,
             redis_url: env::var("REDIS_URL").context("ZORUNLU: REDIS_URL")?,
             
-            // public_ip: sbc_public_ip, // Kendi Public IP'sini de buradan alıyor.
-            public_ip: node_ip, // Artık SBC'nin Public IP'si değil, kendi iç IP'si!
+            public_ip: node_ip, 
             
-            public_sip_port, // [EKLENDİ]
+            public_sip_port,
             sip_realm: env::var("SIP_SIGNALING_SERVICE_REALM").unwrap_or_else(|_| "sentiric_demo".to_string()),
 
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
             rust_log: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-            service_version: env::var("SERVICE_VERSION").unwrap_or_else(|_| "1.4.3".to_string()), // Versiyonu güncelleyelim
+            log_format: env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string()), // [YENİ]
+            service_version: env::var("SERVICE_VERSION").unwrap_or_else(|_| "1.4.3".to_string()),
             
             cert_path: env::var("B2BUA_SERVICE_CERT_PATH").context("ZORUNLU: B2BUA_SERVICE_CERT_PATH")?,
             key_path: env::var("B2BUA_SERVICE_KEY_PATH").context("ZORUNLU: B2BUA_SERVICE_KEY_PATH")?,
