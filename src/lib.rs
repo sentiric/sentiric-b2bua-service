@@ -1,8 +1,8 @@
-// sentiric-b2bua-service/src/lib.rs
 pub mod app;
 pub mod config;
 pub mod error;
 pub mod grpc;
 pub mod tls;
 pub mod sip;
-pub mod rabbitmq; // YENİ
+pub mod rabbitmq;
+pub mod telemetry; // YENİ EKLENDİ
