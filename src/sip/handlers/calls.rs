@@ -1,8 +1,9 @@
+// src/sip/handlers/calls.rs
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, warn};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -65,26 +66,28 @@ impl CallHandler {
                 let action = resolution.action.as_ref().unwrap();
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
+                // [SUTS v4.0]: DIALPLAN DECISION
                 info!(
                     event = "DIALPLAN_DECISION",
-                    trace_id = %call_id,
                     sip.call_id = %call_id,
                     action.type = ?action_type,
+                    dialplan.id = %resolution.dialplan_id,
                     "🧠 Dialplan kararı uygulandı"
                 );
 
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => {
+                        // [SUTS v4.0]: MEDIA ALLOCATION
                         info!(
                             event = "MEDIA_PORT_ALLOCATED",
-                            trace_id = %call_id,
+                            sip.call_id = %call_id,
                             rtp.port = p,
                             "🎤 RTP Portu tahsis edildi"
                         );
                         p
                     },
                     Err(e) => {
-                        error!(event="MEDIA_ALLOC_FAIL", trace_id=%call_id, error=%e, "Media failure");
+                        error!(event="MEDIA_ALLOC_FAIL", sip.call_id=%call_id, error=%e, "Media failure");
                         let _ = transport.send(&SipResponseFactory::create_error(&req, 503, "Media Error").to_bytes(), src_addr).await;
                         return;
                     }
@@ -92,17 +95,25 @@ impl CallHandler {
 
                 let sbc_rtp_target = self.extract_rtp_target_from_sdp(&req.body)
                     .unwrap_or_else(|| {
-                        warn!(event="SDP_PARSE_FAIL", trace_id=%call_id, "SDP parsing failed. Using source IP fallback.");
+                        warn!(event="SDP_PARSE_FAIL", sip.call_id=%call_id, "SDP parsing failed. Using source IP fallback.");
                         format!("{}:{}", src_addr.ip(), 30000) 
                     });
 
+                // ACTION: ECHO TEST
                 if action_type == ActionType::EchoTest {
-                    info!(event="ECHO_TEST_START", trace_id=%call_id, target=%sbc_rtp_target, "🔊 Echo Test Başlatılıyor");
+                    info!(
+                        event = "ECHO_TEST_START", 
+                        sip.call_id = %call_id, 
+                        target = %sbc_rtp_target, 
+                        "🔊 Echo Test Başlatılıyor"
+                    );
                     let mut media_client = { self.clients.lock().await.media.clone() };
+                    // NAT Warmer
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
                         server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target.clone(),
                     })).await;
+                    // Echo Enable
                     let _ = media_client.play_audio(Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target.clone(),
@@ -140,22 +151,22 @@ impl CallHandler {
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
-                    info!(event="CALL_ESTABLISHED", trace_id=%call_id, "✅ Çağrı kuruldu (200 OK)");
+                    // [SUTS v4.0]: CALL ESTABLISHED
+                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, "✅ Çağrı kuruldu (200 OK)");
                 }
             },
             Err(e) => {
-                error!(event="DIALPLAN_ERROR", trace_id=%call_id, error=%e, "Dialplan hatası");
+                error!(event="DIALPLAN_ERROR", sip.call_id=%call_id, error=%e, "Dialplan hatası");
                 let _ = transport.send(&SipResponseFactory::create_error(&req, 500, "Routing Error").to_bytes(), src_addr).await;
             }
         }
     }
     
-    // --- GÜNCELLENMİŞ EKSİKSİZ METODLAR ---
+    // --- OUTBOUND ---
 
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
         info!(
             event = "OUTBOUND_CALL_INIT",
-            trace_id = %call_id,
             sip.call_id = %call_id,
             to.uri = %to_uri,
             "🚀 Dış arama (Outbound) başlatılıyor"
@@ -189,7 +200,7 @@ impl CallHandler {
         
         info!(
             event = "OUTBOUND_INVITE_SENT",
-            trace_id = %call_id,
+            sip.call_id = %call_id,
             sip.method = "INVITE",
             net.dst.addr = %proxy_addr,
             "📤 Dış arama için INVITE gönderildi"
@@ -203,7 +214,6 @@ impl CallHandler {
         
         info!(
             event = "BYE_RECEIVED",
-            trace_id = %call_id,
             sip.call_id = %call_id,
             "🛑 Çağrı sonlandırma isteği alındı"
         );
@@ -214,9 +224,9 @@ impl CallHandler {
             self.media_mgr.release_port(session.data.rtp_port).await;
             self.event_mgr.publish_call_ended(&call_id).await;
             
+            // [SUTS v4.0]: TERMINATED
             info!(
                 event = "CALL_TERMINATED",
-                trace_id = %call_id,
                 sip.call_id = %call_id,
                 reason = "BYE from UA",
                 "✅ Çağrı temizlendi ve kaynaklar serbest bırakıldı"
@@ -224,7 +234,7 @@ impl CallHandler {
         } else {
             warn!(
                 event = "CALL_NOT_FOUND",
-                trace_id = %call_id,
+                sip.call_id = %call_id,
                 "⚠️ BYE alındı ama aktif oturum bulunamadı"
             );
         }
@@ -236,7 +246,6 @@ impl CallHandler {
         
         info!(
             event = "SIP_ACK_RECEIVED",
-            trace_id = %call_id,
             sip.call_id = %call_id,
             "ACK alındı, diyalog tamamen kuruldu"
         );

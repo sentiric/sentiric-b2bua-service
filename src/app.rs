@@ -1,3 +1,4 @@
+// src/app.rs
 use crate::config::AppConfig;
 use crate::grpc::service::MyB2BuaService;
 use crate::grpc::client::InternalClients;
@@ -14,7 +15,7 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tonic::transport::Server as GrpcServer; 
-use tracing::{error, info, warn}; // warn artık kullanılıyor
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 use hyper::{
     service::{make_service_fn, service_fn},
@@ -54,6 +55,7 @@ impl App {
             );
             subscriber.with(fmt::layer().event_format(suts_formatter)).init();
         } else {
+            // Development/Text Mode
             subscriber.with(fmt::layer().compact()).init();
         }
 

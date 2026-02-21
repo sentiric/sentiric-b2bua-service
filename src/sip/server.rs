@@ -1,7 +1,8 @@
+// src/sip/server.rs
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn, debug};
-use sentiric_sip_core::{SipTransport, parser, HeaderName}; // HeaderName eklendi
+use sentiric_sip_core::{SipTransport, parser, HeaderName};
 use crate::sip::engine::B2BuaEngine;
 
 pub struct SipServer {
@@ -30,21 +31,23 @@ impl SipServer {
                 res = socket.recv_from(&mut buf) => {
                     match res {
                         Ok((len, src_addr)) => {
-                            if len < 4 || buf[..len].iter().all(|&b| b == b'\r' || b == b'\n' || b == 0) {
+                            if len < 4 { continue; }
+                            
+                            // Keep-Alive filtrele
+                            if len <= 4 && buf[..len].iter().all(|&b| b == b'\r' || b == b'\n' || b == 0) {
                                 continue;
                             }
 
                             let data = &buf[..len];
                             match parser::parse(data) {
                                 Ok(packet) => {
-                                    // INGRESS LOG
+                                    // [SUTS v4.0]: INGRESS LOG
                                     let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
                                     let method = packet.method.as_str();
                                     
                                     debug!(
                                         event = "SIP_PACKET_RECEIVED",
-                                        trace_id = %call_id,
-                                        sip.call_id = %call_id,
+                                        sip.call_id = %call_id, // Trace ID'ye dönüşecek
                                         sip.method = %method,
                                         net.src.ip = %src_addr.ip(),
                                         net.src.port = src_addr.port(),

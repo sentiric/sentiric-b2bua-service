@@ -1,4 +1,4 @@
-// sentiric-b2bua-service/src/sip/engine.rs
+// src/sip/engine.rs
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -36,6 +36,7 @@ impl B2BuaEngine {
     }
 
     pub async fn send_outbound_invite(&self, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
+        // Bu metod artık doğrudan handler'ı çağırıyor ve handler'da loglama yapılıyor.
         self.call_handler.process_outbound_invite(self.transport.clone(), call_id, from_uri, to_uri).await
     }
 
@@ -52,11 +53,12 @@ impl B2BuaEngine {
 
         match action {
             TransactionAction::Retransmit(cached_resp) => {
+                debug!(event="SIP_RETRANSMIT", sip.call_id=%call_id, "Tekrar eden paket");
                 let _ = self.transport.send(&cached_resp.to_bytes(), src_addr).await;
             },
             TransactionAction::Ignore => return,
             TransactionAction::ForwardToApp => {
-                // [FIX]: is_request() helper kullanımı
+                // [FIX]: is_request() fonksiyonunu kullan
                 if packet.is_request() {
                     match packet.method {
                         Method::Invite => self.call_handler.process_invite(self.transport.clone(), packet, src_addr).await,
