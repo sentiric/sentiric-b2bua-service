@@ -1,9 +1,9 @@
-// src/sip/handlers/calls.rs
+// sentiric-b2bua-service/src/sip/handlers/calls.rs
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -55,9 +55,14 @@ impl CallHandler {
 
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
-            clients.dialplan.resolve_dialplan(Request::new(ResolveDialplanRequest {
+            
+            // [CRITICAL FIX]: Trace ID Injection
+            let mut dp_req = Request::new(ResolveDialplanRequest {
                 caller_contact_value: from.clone(), destination_number: to_aor,
-            })).await
+            });
+            let _ = dp_req.metadata_mut().insert("x-trace-id", call_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
+            
+            clients.dialplan.resolve_dialplan(dp_req).await
         };
 
         match dialplan_res {
@@ -66,7 +71,6 @@ impl CallHandler {
                 let action = resolution.action.as_ref().unwrap();
                 let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
 
-                // [SUTS v4.0]: DIALPLAN DECISION
                 info!(
                     event = "DIALPLAN_DECISION",
                     sip.call_id = %call_id,
@@ -77,7 +81,6 @@ impl CallHandler {
 
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => {
-                        // [SUTS v4.0]: MEDIA ALLOCATION
                         info!(
                             event = "MEDIA_PORT_ALLOCATED",
                             sip.call_id = %call_id,
@@ -99,7 +102,6 @@ impl CallHandler {
                         format!("{}:{}", src_addr.ip(), 30000) 
                     });
 
-                // ACTION: ECHO TEST
                 if action_type == ActionType::EchoTest {
                     info!(
                         event = "ECHO_TEST_START", 
@@ -107,17 +109,23 @@ impl CallHandler {
                         target = %sbc_rtp_target, 
                         "🔊 Echo Test Başlatılıyor"
                     );
+                    
                     let mut media_client = { self.clients.lock().await.media.clone() };
-                    // NAT Warmer
-                    let _ = media_client.play_audio(Request::new(PlayAudioRequest {
+                    
+                    // [CRITICAL FIX]: Trace ID Injection for Media Service PlayAudio
+                    let mut play_req1 = Request::new(PlayAudioRequest {
                         audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
                         server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target.clone(),
-                    })).await;
-                    // Echo Enable
-                    let _ = media_client.play_audio(Request::new(PlayAudioRequest {
+                    });
+                    let _ = play_req1.metadata_mut().insert("x-trace-id", call_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
+                    let _ = media_client.play_audio(play_req1).await;
+
+                    let mut play_req2 = Request::new(PlayAudioRequest {
                         audio_uri: "control://enable_echo".to_string(),
                         server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target.clone(),
-                    })).await;
+                    });
+                    let _ = play_req2.metadata_mut().insert("x-trace-id", call_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()));
+                    let _ = media_client.play_audio(play_req2).await;
                 }
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
@@ -151,7 +159,6 @@ impl CallHandler {
 
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
-                    // [SUTS v4.0]: CALL ESTABLISHED
                     info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, "✅ Çağrı kuruldu (200 OK)");
                 }
             },
@@ -162,8 +169,7 @@ impl CallHandler {
         }
     }
     
-    // --- OUTBOUND ---
-
+    // ... (process_outbound_invite, process_bye, process_ack same as before)
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
         info!(
             event = "OUTBOUND_CALL_INIT",
@@ -171,7 +177,6 @@ impl CallHandler {
             to.uri = %to_uri,
             "🚀 Dış arama (Outbound) başlatılıyor"
         );
-
         let rtp_port = self.media_mgr.allocate_port(call_id).await?;
         let sdp_body = self.media_mgr.generate_sdp(rtp_port);
         let mut invite = SipPacket::new_request(sentiric_sip_core::Method::Invite, to_uri.to_string());
@@ -195,7 +200,6 @@ impl CallHandler {
         self.calls.insert(CallSession::new(session_data)).await;
 
         let proxy_addr: SocketAddr = self.config.proxy_sip_addr.parse()?;
-        
         transport.send(&invite.to_bytes(), proxy_addr).await?;
         
         info!(
@@ -205,26 +209,20 @@ impl CallHandler {
             net.dst.addr = %proxy_addr,
             "📤 Dış arama için INVITE gönderildi"
         );
-        
         Ok(())
     }
 
     pub async fn process_bye(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        
         info!(
             event = "BYE_RECEIVED",
             sip.call_id = %call_id,
             "🛑 Çağrı sonlandırma isteği alındı"
         );
-
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
-        
         if let Some(session) = self.calls.remove(&call_id).await {
             self.media_mgr.release_port(session.data.rtp_port).await;
             self.event_mgr.publish_call_ended(&call_id).await;
-            
-            // [SUTS v4.0]: TERMINATED
             info!(
                 event = "CALL_TERMINATED",
                 sip.call_id = %call_id,
@@ -241,9 +239,7 @@ impl CallHandler {
     }
 
     pub async fn process_ack(&self, call_id: &str) {
-        // State update
         self.calls.update_state(call_id, CallState::Established).await;
-        
         info!(
             event = "SIP_ACK_RECEIVED",
             sip.call_id = %call_id,
