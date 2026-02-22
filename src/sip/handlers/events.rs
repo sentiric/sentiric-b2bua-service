@@ -1,7 +1,7 @@
+// sentiric-b2bua-service/src/sip/handlers/events.rs
 use std::sync::Arc;
 use prost_types::Timestamp;
 use prost::Message;
-use uuid::Uuid;
 use std::time::SystemTime;
 use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, CallEndedEvent, MediaInfo};
 use sentiric_contracts::sentiric::dialplan::v1::ResolveDialplanResponse;
@@ -22,7 +22,8 @@ impl EventManager {
     ) {
         let event = CallStartedEvent { 
             event_type: "call.started".to_string(), 
-            trace_id: Uuid::new_v4().to_string(), 
+            // [HATA 3 ÇÖZÜMÜ]: Uuid::new_v4() yerine orjinal call_id'yi trace_id yapıyoruz.
+            trace_id: call_id.to_string(), 
             call_id: call_id.to_string(), 
             from_uri: from.to_string(), 
             to_uri: to.to_string(), 
@@ -39,7 +40,8 @@ impl EventManager {
     pub async fn publish_call_ended(&self, call_id: &str) {
         let event = CallEndedEvent { 
             event_type: "call.ended".to_string(), 
-            trace_id: Uuid::new_v4().to_string(), 
+            // [HATA 3 ÇÖZÜMÜ]: Uuid::new_v4() yerine orjinal call_id'yi trace_id yapıyoruz.
+            trace_id: call_id.to_string(), 
             call_id: call_id.to_string(), 
             timestamp: Some(Timestamp::from(SystemTime::now())), 
             reason: "normal_clearing".to_string() 

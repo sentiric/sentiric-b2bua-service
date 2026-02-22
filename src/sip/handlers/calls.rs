@@ -2,8 +2,8 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
-use std::str::FromStr; // [FIX]: EKLENDİ (Daha önce de vardı ama garanti olsun)
-use tracing::{info, error, warn}; // unused debug uyarısı için temizlendi
+use std::str::FromStr;
+use tracing::{info, error, warn};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -60,7 +60,6 @@ impl CallHandler {
                 caller_contact_value: from.clone(), destination_number: to_aor,
             });
             
-            // [FIX]: MetadataValue kullanımı düzeltildi
             if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id) {
                 dp_req.metadata_mut().insert("x-trace-id", val);
             }
@@ -115,23 +114,29 @@ impl CallHandler {
                     
                     let mut media_client = { self.clients.lock().await.media.clone() };
                     
-                    let mut play_req1 = Request::new(PlayAudioRequest {
-                        audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
-                        server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target.clone(),
-                    });
-                    if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id) {
-                        play_req1.metadata_mut().insert("x-trace-id", val);
-                    }
-                    let _ = media_client.play_audio(play_req1).await;
+                    // [HATA 4 ÇÖZÜMÜ]: Medya istekleri arka plana atıldı, SIP akışı bloke olmayacak!
+                    let sbc_rtp_target_clone = sbc_rtp_target.clone();
+                    let call_id_clone = call_id.clone();
+                    
+                    tokio::spawn(async move {
+                        let mut play_req1 = Request::new(PlayAudioRequest {
+                            audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
+                            server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target_clone.clone(),
+                        });
+                        if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
+                            play_req1.metadata_mut().insert("x-trace-id", val.clone());
+                        }
+                        let _ = media_client.play_audio(play_req1).await;
 
-                    let mut play_req2 = Request::new(PlayAudioRequest {
-                        audio_uri: "control://enable_echo".to_string(),
-                        server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target.clone(),
+                        let mut play_req2 = Request::new(PlayAudioRequest {
+                            audio_uri: "control://enable_echo".to_string(),
+                            server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target_clone,
+                        });
+                        if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
+                            play_req2.metadata_mut().insert("x-trace-id", val);
+                        }
+                        let _ = media_client.play_audio(play_req2).await;
                     });
-                    if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id) {
-                        play_req2.metadata_mut().insert("x-trace-id", val);
-                    }
-                    let _ = media_client.play_audio(play_req2).await;
                 }
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
@@ -174,7 +179,6 @@ impl CallHandler {
             }
         }
     }
-    
     
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
         info!(
@@ -228,7 +232,6 @@ impl CallHandler {
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
         
         if let Some(session) = self.calls.remove(&call_id).await {
-            // [FIX]: call_id parametresi ile çağrılıyor
             self.media_mgr.release_port(session.data.rtp_port, &call_id).await;
             
             self.event_mgr.publish_call_ended(&call_id).await;
