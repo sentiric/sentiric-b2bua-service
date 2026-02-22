@@ -57,50 +57,38 @@ impl App {
             subscriber.with(fmt::layer().compact()).init();
         }
 
-        info!(
-            event = "SYSTEM_STARTUP",
-            service_name = "sentiric-b2bua-service",
-            version = %config.service_version,
-            profile = %config.env,
-            "🚀 B2BUA Servisi Başlatılıyor (SUTS v4.0)"
-        );
+        info!(event = "SYSTEM_STARTUP", service="sentiric-b2bua-service", "🚀 B2BUA Servisi Başlatılıyor");
         Ok(Self { config })
     }
 
     pub async fn run(self) -> Result<()> {
+        // [GARANTİ ISITMA]: Standart Output'a doğrudan yazıyoruz.
+        println!("🔥 [EARLY-BIND] B2BUA Başlatılıyor. UDP Portu açılıyor...");
+
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
 
-        // [KRİTİK GÜNCELLEME 1]: ERKEN PORT BAĞLAMA (Early Binding)
-        // Diğer servis bağlantılarını beklemeden UDP portunu açıyoruz.
+        // 1. UDP BINDING (En Başta)
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
-        info!(event="SIP_BINDING_INIT", bind=%bind_addr, "UDP Portu erkenden bağlanıyor...");
-        
         let transport = Arc::new(SipTransport::new(&bind_addr).await
             .with_context(|| format!("UDP Portuna bağlanılamadı: {}", bind_addr))?);
-            
-        info!(event="SIP_BINDING_SUCCESS", "✅ UDP Portu dinlemeye alındı. Paketler tamponlanıyor.");
+        
+        println!("✅ [EARLY-BIND] UDP Portu dinleniyor: {}", bind_addr);
 
-        // [KRİTİK GÜNCELLEME 2]: NETWORK WARMER (Ağ Isıtıcı)
-        // Proxy'ye boş bir paket atarak ARP/Route tablolarını güncelliyoruz.
+        // 2. NETWORK WARMER
         if let Ok(proxy_addr) = self.config.proxy_sip_addr.parse::<std::net::SocketAddr>() {
-            let warmer_packet = [0u8; 4]; // Boş/Ping paketi
+            let warmer_packet = [0u8; 4]; 
             let socket = transport.get_socket();
-            match socket.send_to(&warmer_packet, proxy_addr).await {
-                Ok(_) => info!(event="NETWORK_WARMER_SENT", target=%proxy_addr, "🌐 Ağ yolu ısıtma paketi gönderildi."),
-                Err(e) => warn!(event="NETWORK_WARMER_FAIL", error=%e, "Ağ ısıtma paketi gönderilemedi."),
-            }
+            let _ = socket.send_to(&warmer_packet, proxy_addr).await;
+            println!("🌐 [NETWORK-WARMER] Isıtma paketi gönderildi -> {}", proxy_addr);
         }
 
-        // 1. Clients (Retry Logic)
+        // 3. Clients
         let clients = loop {
             tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => {
-                    warn!(event="STARTUP_ABORT", "Başlangıç sırasında kapatma sinyali.");
-                    return Ok(());
-                },
+                _ = shutdown_rx.recv() => return Ok(()),
                 res = InternalClients::connect(&self.config) => {
                     match res {
                         Ok(c) => {
@@ -116,24 +104,23 @@ impl App {
             }
         };
 
-        // 2. Redis
+        // 4. Redis & RabbitMQ
         info!(event="REDIS_CONNECT", url=%self.config.redis_url, "Redis başlatılıyor...");
         let calls = CallStore::new(&self.config.redis_url).await.context("Call Store hatası")?;
 
-        // 3. RabbitMQ
         info!(event="RABBITMQ_CONNECT", url=%self.config.rabbitmq_url, "RabbitMQ başlatılıyor...");
         let rabbitmq_client = Arc::new(RabbitMqClient::new(&self.config.rabbitmq_url).await.context("RabbitMQ hatası")?);
 
-        // 4. Engine
+        // 5. Engine
         let engine = Arc::new(B2BuaEngine::new(
             self.config.clone(), 
             clients, 
             calls, 
-            transport.clone(), // Erken oluşturulan transport'u kullan
+            transport.clone(), 
             rabbitmq_client
         ));
 
-        // 5. Servers
+        // 6. Start Servers
         let sip_server = SipServer::new(engine.clone(), transport);
         let sip_handle = tokio::spawn(async move { sip_server.run(sip_shutdown_rx).await; });
 
@@ -162,9 +149,7 @@ impl App {
             res = grpc_server_handle => { if let Err(e) = res? { error!("gRPC Error: {}", e); } },
             _res = http_server_handle => {}, 
             _res = sip_handle => {}, 
-            _ = ctrl_c => { 
-                warn!(event="SIGINT_RECEIVED", "Kapatma sinyali (Ctrl+C) alındı."); 
-            },
+            _ = ctrl_c => { warn!(event="SIGINT_RECEIVED", "Kapatma sinyali (Ctrl+C) alındı."); },
         }
 
         let _ = shutdown_tx.send(()).await;

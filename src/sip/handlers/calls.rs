@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr; 
-use tracing::{info, error, warn, debug}; // [DÜZELTME]: debug import edildi
+use tracing::{info, error, warn, debug};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -56,15 +56,12 @@ impl CallHandler {
 
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
-            
             let mut dp_req = Request::new(ResolveDialplanRequest {
                 caller_contact_value: from.clone(), destination_number: to_aor,
             });
-            
             if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id) {
                 dp_req.metadata_mut().insert("x-trace-id", val);
             }
-            
             clients.dialplan.resolve_dialplan(dp_req).await
         };
 
@@ -102,7 +99,6 @@ impl CallHandler {
 
                 if action_type == ActionType::EchoTest {
                     info!(event = "ECHO_TEST_START", sip.call_id = %call_id, target = %sbc_rtp_target, "🔊 Echo Test Başlatılıyor");
-                    
                     let mut media_client = { self.clients.lock().await.media.clone() };
                     let sbc_rtp_target_clone = sbc_rtp_target.clone();
                     let call_id_clone = call_id.clone();
@@ -139,7 +135,11 @@ impl CallHandler {
                     }
                 }
 
-                let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.public_sip_port);
+                // [KRİTİK DÜZELTME]: Contact başlığında artık SBC'nin Public IP'si kullanılacak.
+                // Eskiden: self.config.public_ip (Bu POD IP'siydi ve yanlıştı)
+                // Şimdi: self.config.sbc_public_ip (Bu dış IP)
+                let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
+                
                 ok_resp.headers.push(Header::new(HeaderName::Contact, contact_uri));
                 ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                 ok_resp.headers.retain(|h| h.name != HeaderName::ContentLength);
@@ -163,15 +163,8 @@ impl CallHandler {
                 self.calls.insert(session).await;
 
                 let packet_bytes = ok_resp.to_bytes();
-                
-                // [YENİ EKLENDİ]: SBC'nin neden drop ettiğini bulmak için HAM SİP PAKETİ logu
                 let raw_str = String::from_utf8_lossy(&packet_bytes);
-                debug!(
-                    event = "SIP_RAW_DUMP",
-                    sip.call_id = %call_id,
-                    payload = %raw_str,
-                    "🚨 DEBUG: B2BUA'dan çıkan 200 OK paketi"
-                );
+                debug!(event = "SIP_RAW_DUMP", sip.call_id = %call_id, payload = %raw_str, "🚨 DEBUG: B2BUA'dan çıkan 200 OK paketi");
 
                 if transport.send(&packet_bytes, src_addr).await.is_ok() {
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
@@ -186,12 +179,7 @@ impl CallHandler {
     }
     
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
-        info!(
-            event = "OUTBOUND_CALL_INIT",
-            sip.call_id = %call_id,
-            to.uri = %to_uri,
-            "🚀 Dış arama (Outbound) başlatılıyor"
-        );
+        info!(event = "OUTBOUND_CALL_INIT", sip.call_id = %call_id, "🚀 Dış arama başlatılıyor");
         let rtp_port = self.media_mgr.allocate_port(call_id).await?;
         let sdp_body = self.media_mgr.generate_sdp(rtp_port);
         let mut invite = SipPacket::new_request(sentiric_sip_core::Method::Invite, to_uri.to_string());
@@ -201,6 +189,11 @@ impl CallHandler {
         invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to_uri)));
         invite.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
+        
+        // [DÜZELTME]: Outbound için de Contact düzeltildi
+        let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
+        invite.headers.push(Header::new(HeaderName::Contact, contact_uri));
+
         invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         invite.headers.push(Header::new(HeaderName::ContentLength, sdp_body.len().to_string()));
         invite.body = sdp_body;
@@ -217,50 +210,25 @@ impl CallHandler {
 
         let proxy_addr: SocketAddr = self.config.proxy_sip_addr.parse()?;
         transport.send(&invite.to_bytes(), proxy_addr).await?;
-        
-        info!(
-            event = "OUTBOUND_INVITE_SENT",
-            sip.call_id = %call_id,
-            sip.method = "INVITE",
-            net.dst.addr = %proxy_addr,
-            "📤 Dış arama için INVITE gönderildi"
-        );
         Ok(())
     }
 
     pub async fn process_bye(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        info!(
-            event = "BYE_RECEIVED",
-            sip.call_id = %call_id,
-            "🛑 Çağrı sonlandırma isteği alındı"
-        );
+        info!(event = "BYE_RECEIVED", sip.call_id = %call_id, "🛑 Çağrı sonlandırma isteği alındı");
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
         
         if let Some(session) = self.calls.remove(&call_id).await {
             self.media_mgr.release_port(session.data.rtp_port, &call_id).await;
             self.event_mgr.publish_call_ended(&call_id).await;
-            info!(
-                event = "CALL_TERMINATED",
-                sip.call_id = %call_id,
-                reason = "BYE from UA",
-                "✅ Çağrı temizlendi ve kaynaklar serbest bırakıldı"
-            );
-        } else {
-            warn!(
-                event = "CALL_NOT_FOUND",
-                sip.call_id = %call_id,
-                "⚠️ BYE alındı ama aktif oturum bulunamadı"
-            );
+            info!(event = "CALL_TERMINATED", sip.call_id = %call_id, "✅ Çağrı temizlendi");
         }
     }
 
-    // [DÜZELTME]: Derleme hatası veren 487 logic'i silindi. Sadece 200 OK ve kaynak temizliği yapılıyor.
     pub async fn process_cancel(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         info!(event = "CANCEL_RECEIVED", sip.call_id = %call_id, "🛑 Arama iptal edildi (CANCEL)");
         
-        // Sadece CANCEL isteğine 200 OK dön
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
         
         if let Some(session) = self.calls.remove(&call_id).await {
@@ -272,10 +240,6 @@ impl CallHandler {
 
     pub async fn process_ack(&self, call_id: &str) {
         self.calls.update_state(call_id, CallState::Established).await;
-        info!(
-            event = "SIP_ACK_RECEIVED",
-            sip.call_id = %call_id,
-            "ACK alındı, diyalog tamamen kuruldu"
-        );
+        info!(event = "SIP_ACK_RECEIVED", sip.call_id = %call_id, "ACK alındı, diyalog tamamen kuruldu");
     }
 }
