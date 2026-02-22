@@ -34,7 +34,7 @@ pub struct AppConfig {
     pub rust_log: String,
     pub log_format: String,
     pub service_version: String,
-    pub node_hostname: String, // YENİ
+    pub node_hostname: String,
     
     pub cert_path: String,
     pub key_path: String,
@@ -78,8 +78,11 @@ impl AppConfig {
             env: env::var("ENV").unwrap_or_else(|_| "production".to_string()),
             rust_log: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
             log_format: env::var("LOG_FORMAT").unwrap_or_else(|_| "json".to_string()),
+            
+            // [DÜZELTME]: Versiyonu derleme zamanında Cargo.toml'dan al (SUTS Resource Compliance)
             service_version: env!("CARGO_PKG_VERSION").to_string(),
-            node_hostname: env::var("NODE_HOSTNAME").unwrap_or_else(|_| "localhost".to_string()), // YENİ
+            
+            node_hostname: env::var("NODE_HOSTNAME").unwrap_or_else(|_| "localhost".to_string()),
             cert_path: env::var("B2BUA_SERVICE_CERT_PATH").context("CERT PATH")?,
             key_path: env::var("B2BUA_SERVICE_KEY_PATH").context("KEY PATH")?,
             ca_path: env::var("GRPC_TLS_CA_PATH").context("CA PATH")?,
