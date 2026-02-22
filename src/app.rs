@@ -55,7 +55,6 @@ impl App {
             );
             subscriber.with(fmt::layer().event_format(suts_formatter)).init();
         } else {
-            // Development/Text Mode
             subscriber.with(fmt::layer().compact()).init();
         }
 
@@ -73,6 +72,14 @@ impl App {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
+
+        // [KRİTİK DÜZELTME - ADIM 0]: UDP Portunu EN BAŞTA bağla!
+        // Diğer servisler (Redis/RabbitMQ) gecikse bile port açık olmalı ki
+        // İşletim Sistemi gelen SIP paketlerini Kernel Buffer'ında tutsun.
+        let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
+        info!(event="SIP_BINDING_START", bind=%bind_addr, "UDP Portu erkenden bağlanıyor...");
+        let transport = Arc::new(SipTransport::new(&bind_addr).await.context("SIP Port Bind Hatası")?);
+        info!(event="SIP_BINDING_SUCCESS", "✅ UDP Portu dinlemeye alındı. Paketler artık tamponlanacak.");
 
         // 1. Clients (Retry Logic)
         let clients = loop {
@@ -105,10 +112,7 @@ impl App {
         info!(event="RABBITMQ_CONNECT", url=%self.config.rabbitmq_url, "RabbitMQ başlatılıyor...");
         let rabbitmq_client = Arc::new(RabbitMqClient::new(&self.config.rabbitmq_url).await.context("RabbitMQ hatası")?);
 
-        // 4. Engine & Transport
-        let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
-        let transport = Arc::new(SipTransport::new(&bind_addr).await?);
-        
+        // 4. Engine (Artık transport'u dışarıdan alıyor)
         let engine = Arc::new(B2BuaEngine::new(
             self.config.clone(), 
             clients, 
