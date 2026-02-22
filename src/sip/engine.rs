@@ -1,4 +1,4 @@
-// src/sip/engine.rs
+// sentiric-b2bua-service/src/sip/engine.rs
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -42,7 +42,6 @@ impl B2BuaEngine {
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         
-        // [DÜZELTME]: ACK paketlerinin State Machine (TransactionEngine) tarafından yutulması engellendi.
         if packet.method == Method::Ack {
             self.call_handler.process_ack(&call_id).await;
             return;
@@ -67,6 +66,8 @@ impl B2BuaEngine {
                     match packet.method {
                         Method::Invite => self.call_handler.process_invite(self.transport.clone(), packet, src_addr).await,
                         Method::Bye => self.call_handler.process_bye(self.transport.clone(), packet, src_addr).await,
+                        // [YENİ EKLENDİ]: CANCEL artık handle edilecek
+                        Method::Cancel => self.call_handler.process_cancel(self.transport.clone(), packet, src_addr).await,
                         _ => debug!("Method ignored: {:?}", packet.method),
                     }
                 }
