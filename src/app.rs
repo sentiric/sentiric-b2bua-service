@@ -1,4 +1,4 @@
-// src/app.rs
+// sentiric-b2bua-service/src/app.rs
 use crate::config::AppConfig;
 use crate::grpc::service::MyB2BuaService;
 use crate::grpc::client::InternalClients;
@@ -41,7 +41,6 @@ impl App {
         dotenvy::dotenv().ok();
         let config = Arc::new(AppConfig::load_from_env().context("Konfigürasyon yüklenemedi")?);
 
-        // --- SUTS v4.0 LOGGING ---
         let rust_log_env = env::var("RUST_LOG").unwrap_or_else(|_| config.rust_log.clone());
         let env_filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(&rust_log_env))?;
         let subscriber = Registry::default().with(env_filter);
@@ -73,13 +72,26 @@ impl App {
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
 
-        // [KRİTİK DÜZELTME - ADIM 0]: UDP Portunu EN BAŞTA bağla!
-        // Diğer servisler (Redis/RabbitMQ) gecikse bile port açık olmalı ki
-        // İşletim Sistemi gelen SIP paketlerini Kernel Buffer'ında tutsun.
+        // [KRİTİK GÜNCELLEME 1]: ERKEN PORT BAĞLAMA (Early Binding)
+        // Diğer servis bağlantılarını beklemeden UDP portunu açıyoruz.
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
-        info!(event="SIP_BINDING_START", bind=%bind_addr, "UDP Portu erkenden bağlanıyor...");
-        let transport = Arc::new(SipTransport::new(&bind_addr).await.context("SIP Port Bind Hatası")?);
-        info!(event="SIP_BINDING_SUCCESS", "✅ UDP Portu dinlemeye alındı. Paketler artık tamponlanacak.");
+        info!(event="SIP_BINDING_INIT", bind=%bind_addr, "UDP Portu erkenden bağlanıyor...");
+        
+        let transport = Arc::new(SipTransport::new(&bind_addr).await
+            .with_context(|| format!("UDP Portuna bağlanılamadı: {}", bind_addr))?);
+            
+        info!(event="SIP_BINDING_SUCCESS", "✅ UDP Portu dinlemeye alındı. Paketler tamponlanıyor.");
+
+        // [KRİTİK GÜNCELLEME 2]: NETWORK WARMER (Ağ Isıtıcı)
+        // Proxy'ye boş bir paket atarak ARP/Route tablolarını güncelliyoruz.
+        if let Ok(proxy_addr) = self.config.proxy_sip_addr.parse::<std::net::SocketAddr>() {
+            let warmer_packet = [0u8; 4]; // Boş/Ping paketi
+            let socket = transport.get_socket();
+            match socket.send_to(&warmer_packet, proxy_addr).await {
+                Ok(_) => info!(event="NETWORK_WARMER_SENT", target=%proxy_addr, "🌐 Ağ yolu ısıtma paketi gönderildi."),
+                Err(e) => warn!(event="NETWORK_WARMER_FAIL", error=%e, "Ağ ısıtma paketi gönderilemedi."),
+            }
+        }
 
         // 1. Clients (Retry Logic)
         let clients = loop {
@@ -112,12 +124,12 @@ impl App {
         info!(event="RABBITMQ_CONNECT", url=%self.config.rabbitmq_url, "RabbitMQ başlatılıyor...");
         let rabbitmq_client = Arc::new(RabbitMqClient::new(&self.config.rabbitmq_url).await.context("RabbitMQ hatası")?);
 
-        // 4. Engine (Artık transport'u dışarıdan alıyor)
+        // 4. Engine
         let engine = Arc::new(B2BuaEngine::new(
             self.config.clone(), 
             clients, 
             calls, 
-            transport.clone(),
+            transport.clone(), // Erken oluşturulan transport'u kullan
             rabbitmq_client
         ));
 
