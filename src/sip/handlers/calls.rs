@@ -1,8 +1,9 @@
 // sentiric-b2bua-service/src/sip/handlers/calls.rs
+
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
-use std::str::FromStr;
+use std::str::FromStr; 
 use tracing::{info, error, warn};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
@@ -83,12 +84,7 @@ impl CallHandler {
 
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => {
-                        info!(
-                            event = "MEDIA_PORT_ALLOCATED",
-                            sip.call_id = %call_id,
-                            rtp.port = p,
-                            "🎤 RTP Portu tahsis edildi"
-                        );
+                        info!(event = "MEDIA_PORT_ALLOCATED", sip.call_id = %call_id, rtp.port = p, "🎤 RTP Portu tahsis edildi");
                         p
                     },
                     Err(e) => {
@@ -105,19 +101,13 @@ impl CallHandler {
                     });
 
                 if action_type == ActionType::EchoTest {
-                    info!(
-                        event = "ECHO_TEST_START", 
-                        sip.call_id = %call_id, 
-                        target = %sbc_rtp_target, 
-                        "🔊 Echo Test Başlatılıyor"
-                    );
+                    info!(event = "ECHO_TEST_START", sip.call_id = %call_id, target = %sbc_rtp_target, "🔊 Echo Test Başlatılıyor");
                     
                     let mut media_client = { self.clients.lock().await.media.clone() };
-                    
-                    // [HATA 4 ÇÖZÜMÜ]: Medya istekleri arka plana atıldı, SIP akışı bloke olmayacak!
                     let sbc_rtp_target_clone = sbc_rtp_target.clone();
                     let call_id_clone = call_id.clone();
                     
+                    // [DÜZELTME]: Medya istekleri arka plana alındı
                     tokio::spawn(async move {
                         let mut play_req1 = Request::new(PlayAudioRequest {
                             audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
@@ -150,6 +140,11 @@ impl CallHandler {
                 let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.public_ip, self.config.public_sip_port);
                 ok_resp.headers.push(Header::new(HeaderName::Contact, contact_uri));
                 ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+                
+                // [DÜZELTME]: Telefonların SDP'yi kabul etmesi için Content-Length zorunlu kılındı
+                ok_resp.headers.retain(|h| h.name != HeaderName::ContentLength);
+                ok_resp.headers.push(Header::new(HeaderName::ContentLength, sdp_body.len().to_string()));
+                
                 ok_resp.body = sdp_body;
 
                 let mut tx = SipTransaction::new(&req).unwrap();
@@ -196,7 +191,10 @@ impl CallHandler {
         invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to_uri)));
         invite.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
+        
         invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
+        invite.headers.push(Header::new(HeaderName::ContentLength, sdp_body.len().to_string())); // Buraya da eklendi
+        
         invite.body = sdp_body;
 
         let session_data = CallSessionData {

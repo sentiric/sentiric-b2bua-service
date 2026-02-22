@@ -1,4 +1,5 @@
-// sentiric-b2bua-service/src/sip/engine.rs
+// src/sip/engine.rs
+
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
@@ -41,7 +42,7 @@ impl B2BuaEngine {
     pub async fn handle_packet(&self, packet: SipPacket, src_addr: SocketAddr) {
         let call_id = packet.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
         
-        // [HATA 2 ÇÖZÜMÜ]: ACK paketini TransactionEngine yutmasın diye en başta yakalayıp State'i güncelliyoruz!
+        // [DÜZELTME]: ACK paketlerinin State Machine (TransactionEngine) tarafından yutulması engellendi.
         if packet.method == Method::Ack {
             self.call_handler.process_ack(&call_id).await;
             return;
