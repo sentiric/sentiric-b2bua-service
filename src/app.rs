@@ -62,8 +62,8 @@ impl App {
     }
 
     pub async fn run(self) -> Result<()> {
-        // [GARANTİ ISITMA]: Standart Output'a doğrudan yazıyoruz.
-        println!("🔥 [EARLY-BIND] B2BUA Başlatılıyor. UDP Portu açılıyor...");
+        // Manuel JSON Log (Observer görsün diye)
+        println!(r#"{{"schema_v":"1.0.0","ts":"{}","severity":"INFO","message":"🔥 [EARLY-BIND] B2BUA Başlatılıyor","event":"SYSTEM_BOOT"}}"#, chrono::Utc::now().to_rfc3339());
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
@@ -82,6 +82,9 @@ impl App {
             let socket = transport.get_socket();
             let _ = socket.send_to(&warmer_packet, proxy_addr).await;
             println!("🌐 [NETWORK-WARMER] Isıtma paketi gönderildi -> {}", proxy_addr);
+        } else {
+            // [YENİ] Hata Logu
+            println!(r#"{{"schema_v":"1.0.0","severity":"WARN","message":"⚠️ [NETWORK-WARMER] Proxy Adresi Parse Edilemedi: {}","event":"CONFIG_ERROR"}}"#, self.config.proxy_sip_addr);
         }
 
         // 3. Clients
