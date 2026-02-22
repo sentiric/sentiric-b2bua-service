@@ -8,7 +8,7 @@ use sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClie
 use sentiric_contracts::sentiric::dialplan::v1::dialplan_service_client::DialplanServiceClient;
 use tonic::transport::{Channel, ClientTlsConfig, Certificate, Identity};
 use std::time::Duration;
-use tracing::{info, error, warn}; // Error ve Warn logları eklendi
+use tracing::{info, error, warn};
 
 #[derive(Clone)]
 pub struct InternalClients {
@@ -20,14 +20,12 @@ pub struct InternalClients {
 
 impl InternalClients {
     pub async fn connect(config: &AppConfig) -> Result<Self> {
-        info!("🔌 İç servislere bağlanılıyor (mTLS)...");
+        info!("🔌 İç servislere bağlanılıyor (mTLS + KeepAlive)...");
 
-        // Media Service Bağlantısı (Kritik Nokta)
         let media_channel = match create_secure_channel(&config.media_service_url, "media-service", config).await {
             Ok(c) => c,
             Err(e) => {
                 error!("❌ Media Service bağlantı hatası: {:#}", e);
-                // Burada panic yapmak yerine hatayı döndürüp uygulamanın kontrollü çökmesini sağlıyoruz
                 return Err(e);
             }
         };
@@ -48,7 +46,6 @@ impl InternalClients {
 }
 
 async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig) -> Result<Channel> {
-    // URL düzeltme (http -> https zorlama)
     let target_url = if url.starts_with("http") {
         if url.starts_with("http://") {
              warn!("⚠️ Güvensiz URL tespit edildi ({}), HTTPS'e zorlanıyor.", url);
@@ -60,7 +57,6 @@ async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig)
         format!("https://{}", url)
     };
 
-    // Sertifikaları Yükle (Hata yakalama ile)
     let cert = tokio::fs::read(&config.cert_path).await
         .with_context(|| format!("İstemci Sertifikası okunamadı: {}", config.cert_path))?;
     
@@ -81,9 +77,12 @@ async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig)
 
     info!("🔗 Bağlanılıyor: {} (SNI: {})", target_url, server_name);
 
-    // Timeout eklenmiş bağlantı
+    // [KRİTİK DÜZELTME]: HTTP/2 Keep-Alive eklendi.
     let channel = Channel::from_shared(target_url)?
-        .connect_timeout(Duration::from_secs(5)) // 5 saniye bağlantı zaman aşımı
+        .connect_timeout(Duration::from_secs(5))
+        .keep_alive_while_idle(true)
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .keep_alive_timeout(Duration::from_secs(5))
         .tls_config(tls_config)?
         .connect()
         .await
