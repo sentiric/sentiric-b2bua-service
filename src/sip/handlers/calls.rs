@@ -11,7 +11,7 @@ use sentiric_sip_core::{
     transaction::SipTransaction,
 };
 use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionType};
-use sentiric_contracts::sentiric::media::v1::PlayAudioRequest;
+use sentiric_contracts::sentiric::media::v1::{PlayAudioRequest, StartRecordingRequest};
 use tonic::Request;
 use crate::config::AppConfig;
 use crate::sip::store::{CallStore, CallSession, CallSessionData, CallState};
@@ -102,20 +102,45 @@ impl CallHandler {
                     let mut media_client = { self.clients.lock().await.media.clone() };
                     let sbc_rtp_target_clone = sbc_rtp_target.clone();
                     let call_id_clone = call_id.clone();
+                    let rtp_port_clone = rtp_port;
                     
                     tokio::spawn(async move {
+                        // 1. [YENİ] Kayıt Başlat (MinIO/S3)
+                        // [FIX]: 'mut' eklendi!
+                        let mut record_req = Request::new(StartRecordingRequest {
+                            call_id: call_id_clone.clone(),
+                            trace_id: call_id_clone.clone(),
+                            server_rtp_port: rtp_port_clone,
+                            output_uri: format!("s3://sentiric/recordings/{}.wav", call_id_clone),
+                            sample_rate: Some(8000), 
+                            format: Some("wav".to_string()),
+                        });
+                        
+                        // Trace ID Propagation
+                        if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
+                             record_req.metadata_mut().insert("x-trace-id", val.clone());
+                        }
+
+                        if let Err(e) = media_client.start_recording(record_req).await {
+                             error!("Recording start failed: {}", e);
+                        } else {
+                             info!("🎙️ Ses kaydı başlatıldı (S3/MinIO)");
+                        }
+
+                        // 2. Play Nat Warmer (Boşluk)
                         let mut play_req1 = Request::new(PlayAudioRequest {
                             audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
-                            server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target_clone.clone(),
+                            server_rtp_port: rtp_port_clone, rtp_target_addr: sbc_rtp_target_clone.clone(),
                         });
                         if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
                             play_req1.metadata_mut().insert("x-trace-id", val.clone());
                         }
                         let _ = media_client.play_audio(play_req1).await;
 
+                        // 3. Enable Echo
                         let mut play_req2 = Request::new(PlayAudioRequest {
                             audio_uri: "control://enable_echo".to_string(),
-                            server_rtp_port: rtp_port, rtp_target_addr: sbc_rtp_target_clone,
+                            server_rtp_port: rtp_port_clone, rtp_target_addr: sbc_rtp_target_clone,
                         });
                         if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
                             play_req2.metadata_mut().insert("x-trace-id", val);
@@ -135,9 +160,7 @@ impl CallHandler {
                     }
                 }
 
-                // [KRİTİK DÜZELTME]: Contact başlığında artık SBC'nin Public IP'si kullanılacak.
-                // Eskiden: self.config.public_ip (Bu POD IP'siydi ve yanlıştı)
-                // Şimdi: self.config.sbc_public_ip (Bu dış IP)
+                // Contact Header Düzeltme
                 let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
                 
                 ok_resp.headers.push(Header::new(HeaderName::Contact, contact_uri));
@@ -190,7 +213,6 @@ impl CallHandler {
         invite.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
         
-        // [DÜZELTME]: Outbound için de Contact düzeltildi
         let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
         invite.headers.push(Header::new(HeaderName::Contact, contact_uri));
 
@@ -246,5 +268,4 @@ impl CallHandler {
         
         info!(event = "SIP_ACK_RECEIVED", sip.call_id = %call_id, "ACK alındı, diyalog tamamen kuruldu (Answer Time Kaydedildi)");
     }
-    
 }
