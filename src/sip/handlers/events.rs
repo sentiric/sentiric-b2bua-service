@@ -3,7 +3,7 @@ use std::sync::Arc;
 use prost_types::Timestamp;
 use prost::Message;
 use std::time::SystemTime;
-use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, CallEndedEvent, MediaInfo};
+use sentiric_contracts::sentiric::event::v1::{CallStartedEvent, CallEndedEvent, MediaInfo, GenericEvent}; // GenericEvent eklendi
 use sentiric_contracts::sentiric::dialplan::v1::ResolveDialplanResponse;
 use crate::rabbitmq::RabbitMqClient;
 
@@ -22,7 +22,6 @@ impl EventManager {
     ) {
         let event = CallStartedEvent { 
             event_type: "call.started".to_string(), 
-            // [HATA 3 ÇÖZÜMÜ]: Uuid::new_v4() yerine orjinal call_id'yi trace_id yapıyoruz.
             trace_id: call_id.to_string(), 
             call_id: call_id.to_string(), 
             from_uri: from.to_string(), 
@@ -37,10 +36,22 @@ impl EventManager {
         let _ = self.rabbitmq.publish_event_bytes("call.started", &event.encode_to_vec()).await;
     }
 
+    // [YENİ]: Çağrı kesinleştiğinde fırlatılacak olay
+    pub async fn publish_call_answered(&self, call_id: &str) {
+        let json_payload = serde_json::json!({ "callId": call_id }).to_string();
+        let event = GenericEvent {
+            event_type: "call.answered".to_string(),
+            trace_id: call_id.to_string(),
+            timestamp: Some(Timestamp::from(SystemTime::now())),
+            tenant_id: "system".to_string(),
+            payload_json: json_payload,
+        };
+        let _ = self.rabbitmq.publish_event_bytes("call.answered", &event.encode_to_vec()).await;
+    }
+
     pub async fn publish_call_ended(&self, call_id: &str) {
         let event = CallEndedEvent { 
             event_type: "call.ended".to_string(), 
-            // [HATA 3 ÇÖZÜMÜ]: Uuid::new_v4() yerine orjinal call_id'yi trace_id yapıyoruz.
             trace_id: call_id.to_string(), 
             call_id: call_id.to_string(), 
             timestamp: Some(Timestamp::from(SystemTime::now())), 

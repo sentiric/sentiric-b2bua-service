@@ -2361,7 +2361,7 @@ checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
 name = "sentiric-b2bua-service"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2402,8 +2402,8 @@ dependencies = [
 
 [[package]]
 name = "sentiric-rtp-core"
-version = "1.5.0"
-source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.5.0#2e78651fb7c6a2bd34459650511de486e4117a97"
+version = "1.5.1"
+source = "git+https://github.com/sentiric/sentiric-rtp-core.git?tag=v1.5.1#f5e49769f3cdd1e2fde0000d7115369f2e99a2e5"
 dependencies = [
  "cc",
  "glob",

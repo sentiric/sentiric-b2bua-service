@@ -240,6 +240,11 @@ impl CallHandler {
 
     pub async fn process_ack(&self, call_id: &str) {
         self.calls.update_state(call_id, CallState::Established).await;
-        info!(event = "SIP_ACK_RECEIVED", sip.call_id = %call_id, "ACK alındı, diyalog tamamen kuruldu");
+        
+        // [YENİ EKLENDİ]: ACK geldiğinde çağrı kesin olarak cevaplanmış demektir.
+        self.event_mgr.publish_call_answered(call_id).await;
+        
+        info!(event = "SIP_ACK_RECEIVED", sip.call_id = %call_id, "ACK alındı, diyalog tamamen kuruldu (Answer Time Kaydedildi)");
     }
+    
 }
