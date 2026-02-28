@@ -1,37 +1,38 @@
 # 🔄 Sentiric B2BUA Service
 
-[![Status](https://img.shields.io/badge/status-vision-lightgrey.svg)]()
+[![Status](https://img.shields.io/badge/status-active-success.svg)]()
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)]()
-[![Protocol](https://img.shields.io/badge/protocol-gRPC_&_SIP-green.svg)]()
+[![Layer](https://img.shields.io/badge/layer-Telecom_Core-blueviolet.svg)]()
 
-**Sentiric B2BUA (Back-to-Back User Agent) Service**, Sentiric platformunda SIP çağrı başlatma ve aktarma (transfer) mantığını yöneten merkezi bir B2BUA çekirdeğidir. AI Agent'tan gelen talepler üzerine, yeni bir arama başlatır (Outbound Dialing) veya mevcut bir çağrıyı başka bir hedefe aktarır (Transfer, REFER).
+**Sentiric B2BUA (Back-to-Back User Agent) Service**, platformun omurgasını oluşturan SIP oturum yöneticisidir. Sentiric'in "Soft-Defined Telecom" (Yazılım Tanımlı Telekom) vizyonunun kalbidir. 
 
-Bu servis, SIP sinyalleşme işlemini tamamladıktan sonra medya akışını başlatması için `media-service`'i koordine eder.
+Kendi içinde hiçbir iş mantığı (AI, Echo, Kayıt) barındırmaz. Sadece ağ bağlantılarını kurar ve platformu olaylardan (Events) haberdar eder.
 
 ## 🎯 Temel Sorumluluklar
 
-1.  **Çağrı Başlatma (InitiateCall):** AI Agent'tan gelen istek üzerine harici bir SIP hedefiyle yeni bir çağrı oturumu başlatır ve bu çağrıya ilişkin sinyalleşmeyi yönetir.
-2.  **Çağrı Transferi (TransferCall):** Mevcut bir aktif çağrıyı (örn: kullanıcının AI ile konuştuğu çağrı) üçüncü bir tarafa (başka bir Agent, harici numara) aktarır.
-3.  **Medya Koordinasyonu:** Çağrı kurulduğunda, medya akışının doğru şekilde kurulması için `media-service`'ten RTP portu tahsisini ister.
-4.  **SIP Uç Nokta Çözümlemesi:** Çağrı hedeflerini bulmak için `registrar-service`'ten destek alır.
+1.  **Aptal Boru (Dumb Pipe):** Harici dünyadan gelen çağrıları (Inbound) ve platformun başlattığı çağrıları (Outbound) standart SIP RFC'lerine göre yönetir.
+2.  **Medya Temini:** Her çağrı için `media-service` üzerinden izole bir RTP portu tahsis eder ve çağrı bitiminde bu portu iade eder.
+3.  **Olay Üreticisi (Event Producer):** Sistemdeki her kritik aşamayı (`call.started`, `call.answered`, `call.ended`) RabbitMQ üzerinden yayınlar. Böylece `Workflow` ve `CDR` gibi servisler ne yapacaklarına karar verirler.
 
 ## 🛠️ Teknoloji Yığını
 
 *   **Dil:** Rust (Yüksek performanslı telkom protokol işleme için)
-*   **Servisler Arası İletişim:** gRPC (Tonic)
-*   **SIP Yönlendirme:** `sentiric-proxy-service` (giden çağrı paketlerini yönlendirmek için)
-*   **Durum/Olay Yönetimi:** Redis ve RabbitMQ (çağrı durumunu ve olaylarını yayınlamak için)
+*   **Servisler Arası İletişim:** gRPC (Tonic, mTLS destekli)
+*   **Olay Yolu:** RabbitMQ (`lapin` kütüphanesi)
+*   **Durum:** Redis (Çağrı durumlarını saklamak için)
 
-## 🔌 API Etkileşimleri
+## 🔌 API ve Olay Etkileşimleri
 
-*   **Gelen (Sunucu):**
-    *   `sentiric-agent-service` (gRPC): `InitiateCall`, `TransferCall` RPC'leri.
-*   **Giden (İstemci):**
-    *   `sentiric-proxy-service` (gRPC): Giden SIP paketlerini göndermek için.
-    *   `sentiric-media-service` (gRPC): RTP port tahsisi ve serbest bırakılması.
-    *   `sentiric-registrar-service` (gRPC): Hedef uç noktayı aramak için.
+*   **Gelen Ağ (SIP):** `sbc-service`'ten gelen UDP sinyalleri.
+*   **Gelen (gRPC):** `agent-service` veya `workflow-service`'ten gelen `InitiateCall` (Dış Arama) emirleri.
+*   **Giden Olaylar (RabbitMQ):**
+    *   `call.started`: Çağrı 200 OK aldığında fırlatılır.
+    *   `call.answered`: Çağrı ACK aldığında (faturalama için) fırlatılır.
+    *   `call.ended`: Çağrı BYE/CANCEL ile kapandığında fırlatılır.
 
 ---
 ## 🏛️ Anayasal Konum
 
-Bu servis, [Sentiric Anayasası'nın](https://github.com/sentiric/sentiric-governance) **Core Logic Layer**'ında yer alan yeni SIP Protokol Yönetimi bileşenidir.
+Bu servis,[Sentiric Anayasası'nın](https://github.com/sentiric/sentiric-governance) **Telecom Core Layer**'ında yer alır. **Kesin kural:** Bu repoya hiçbir zaman spesifik bir ürünün (Oyun, IVR, AI) iş mantığı kodlanamaz.
+
+---
