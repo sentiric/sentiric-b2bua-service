@@ -11,7 +11,6 @@ use sentiric_sip_core::{
     transaction::SipTransaction,
 };
 use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionType};
-use sentiric_contracts::sentiric::media::v1::{PlayAudioRequest, StartRecordingRequest};
 use tonic::Request;
 use crate::config::AppConfig;
 use crate::sip::store::{CallStore, CallSession, CallSessionData, CallState};
@@ -97,57 +96,9 @@ impl CallHandler {
                         format!("{}:{}", src_addr.ip(), 30000) 
                     });
 
-                if action_type == ActionType::EchoTest {
-                    info!(event = "ECHO_TEST_START", sip.call_id = %call_id, target = %sbc_rtp_target, "🔊 Echo Test Başlatılıyor");
-                    let mut media_client = { self.clients.lock().await.media.clone() };
-                    let sbc_rtp_target_clone = sbc_rtp_target.clone();
-                    let call_id_clone = call_id.clone();
-                    let rtp_port_clone = rtp_port;
-                    
-                    tokio::spawn(async move {
-                        // 1. [YENİ] Kayıt Başlat (MinIO/S3)
-                        // [FIX]: 'mut' eklendi!
-                        let mut record_req = Request::new(StartRecordingRequest {
-                            call_id: call_id_clone.clone(),
-                            trace_id: call_id_clone.clone(),
-                            server_rtp_port: rtp_port_clone,
-                            output_uri: format!("s3://sentiric/recordings/{}.wav", call_id_clone),
-                            sample_rate: Some(8000), 
-                            format: Some("wav".to_string()),
-                        });
-                        
-                        // Trace ID Propagation
-                        if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
-                             record_req.metadata_mut().insert("x-trace-id", val.clone());
-                        }
-
-                        if let Err(e) = media_client.start_recording(record_req).await {
-                             error!("Recording start failed: {}", e);
-                        } else {
-                             info!("🎙️ Ses kaydı başlatıldı (S3/MinIO)");
-                        }
-
-                        // 2. Play Nat Warmer (Boşluk)
-                        let mut play_req1 = Request::new(PlayAudioRequest {
-                            audio_uri: "file://audio/tr/system/nat_warmer.wav".to_string(),
-                            server_rtp_port: rtp_port_clone, rtp_target_addr: sbc_rtp_target_clone.clone(),
-                        });
-                        if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
-                            play_req1.metadata_mut().insert("x-trace-id", val.clone());
-                        }
-                        let _ = media_client.play_audio(play_req1).await;
-
-                        // 3. Enable Echo
-                        let mut play_req2 = Request::new(PlayAudioRequest {
-                            audio_uri: "control://enable_echo".to_string(),
-                            server_rtp_port: rtp_port_clone, rtp_target_addr: sbc_rtp_target_clone,
-                        });
-                        if let Ok(val) = tonic::metadata::MetadataValue::from_str(&call_id_clone) {
-                            play_req2.metadata_mut().insert("x-trace-id", val);
-                        }
-                        let _ = media_client.play_audio(play_req2).await;
-                    });
-                }
+                // [LOBOTOMİ YAPILDI]: Echo Test ve StartRecording kodları tamamen silindi.
+                // B2BUA artık komut vermez, sadece sinyal hattını kurar.
+                // Komutları Workflow Service verecek.
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
@@ -160,7 +111,6 @@ impl CallHandler {
                     }
                 }
 
-                // Contact Header Düzeltme
                 let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
                 
                 ok_resp.headers.push(Header::new(HeaderName::Contact, contact_uri));
@@ -189,9 +139,11 @@ impl CallHandler {
                 let raw_str = String::from_utf8_lossy(&packet_bytes);
                 debug!(event = "SIP_RAW_DUMP", sip.call_id = %call_id, payload = %raw_str, "🚨 DEBUG: B2BUA'dan çıkan 200 OK paketi");
 
+                //[MİMARİ ZİRVESİ]: 200 OK gönderilir gönderilmez Olay Fırlatılır.
+                // Workflow bu olayı beklemektedir.
                 if transport.send(&packet_bytes, src_addr).await.is_ok() {
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
-                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, "✅ Çağrı kuruldu (200 OK)");
+                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, "✅ Çağrı kuruldu (200 OK) ve Olay fırlatıldı.");
                 }
             },
             Err(e) => {
@@ -262,10 +214,7 @@ impl CallHandler {
 
     pub async fn process_ack(&self, call_id: &str) {
         self.calls.update_state(call_id, CallState::Established).await;
-        
-        // [YENİ EKLENDİ]: ACK geldiğinde çağrı kesin olarak cevaplanmış demektir.
         self.event_mgr.publish_call_answered(call_id).await;
-        
         info!(event = "SIP_ACK_RECEIVED", sip.call_id = %call_id, "ACK alındı, diyalog tamamen kuruldu (Answer Time Kaydedildi)");
     }
 }
