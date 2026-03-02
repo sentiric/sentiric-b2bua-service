@@ -4,13 +4,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr; 
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
     transaction::SipTransaction,
 };
-use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest, ActionType};
+use sentiric_contracts::sentiric::dialplan::v1::{ResolveDialplanRequest};
 use tonic::Request;
 use crate::config::AppConfig;
 use crate::sip::store::{CallStore, CallSession, CallSessionData, CallState};
@@ -53,6 +53,7 @@ impl CallHandler {
 
         let _ = transport.send(&SipResponseFactory::create_100_trying(&req).to_bytes(), src_addr).await;
 
+        // 1. Dialplan Sorgusu
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             let mut dp_req = Request::new(ResolveDialplanRequest {
@@ -67,17 +68,8 @@ impl CallHandler {
         match dialplan_res {
             Ok(response) => {
                 let resolution = response.into_inner();
-                let action = resolution.action.as_ref().unwrap();
-                let action_type = ActionType::try_from(action.r#type).unwrap_or(ActionType::Unspecified);
-
-                info!(
-                    event = "DIALPLAN_DECISION",
-                    sip.call_id = %call_id,
-                    action.type = ?action_type,
-                    dialplan.id = %resolution.dialplan_id,
-                    "🧠 Dialplan kararı uygulandı"
-                );
-
+                
+                // 2. Media Port Tahsisi
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -91,7 +83,10 @@ impl CallHandler {
                     .unwrap_or_else(|| format!("{}:{}", src_addr.ip(), 30000));
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
+                
+                // [FIX]: generate_sdp artık rtp_port'u KESİN olarak kullanıyor
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
+                
                 let mut ok_resp = SipResponseFactory::create_200_ok(&req);
                 
                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
@@ -102,7 +97,6 @@ impl CallHandler {
                 }
 
                 let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
-                
                 ok_resp.headers.push(Header::new(HeaderName::Contact, contact_uri));
                 ok_resp.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
                 ok_resp.headers.retain(|h| h.name != HeaderName::ContentLength);
@@ -122,26 +116,13 @@ impl CallHandler {
                 };
                 let mut session = CallSession::new(session_data);
                 session.active_transaction = Some(tx);
-
                 self.calls.insert(session).await;
 
+                // 3. SIP Yanıtı ve RabbitMQ Olayı
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
-                    self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution.clone())).await;
-                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, "✅ Çağrı kuruldu (200 OK) ve Olay fırlatıldı.");
-                    
-                    // [DÜZELTME]: Prost naming convention: ACTION_TYPE_ECHO_TEST -> EchoTest
-                    match action_type {
-                        ActionType::EchoTest => {
-                            info!(event = "NATIVE_ACTION_ECHO", sip.call_id = %call_id, "🔊 B2BUA, native Echo Test'i başlatıyor.");
-                            if let Err(e) = self.media_mgr.enable_echo_test(rtp_port, &sbc_rtp_target).await {
-                                error!(event = "ECHO_START_FAIL", error = %e, "Echo testi başlatılamadı.");
-                            }
-                        }
-                        ActionType::BridgeCall => {
-                            warn!(event = "NATIVE_ACTION_BRIDGE_TODO", sip.call_id = %call_id, "🌉 Native BridgeCall henüz implemente edilmedi.");
-                        }
-                        _ => {}
-                    }
+                    // [ÖNEMLİ]: Olay fırlatılırken rtp_port bilgisi Workflow'a gidiyor.
+                    self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
+                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, rtp.port=rtp_port, "✅ Çağrı SIP seviyesinde kuruldu. Top artık Workflow'da.");
                 }
             },
             Err(e) => {
@@ -152,7 +133,6 @@ impl CallHandler {
     }
     
     pub async fn process_outbound_invite(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str, from_uri: &str, to_uri: &str) -> anyhow::Result<()> {
-        info!(event = "OUTBOUND_CALL_INIT", sip.call_id = %call_id, "🚀 Dış arama başlatılıyor");
         let rtp_port = self.media_mgr.allocate_port(call_id).await?;
         let sdp_body = self.media_mgr.generate_sdp(rtp_port);
         let mut invite = SipPacket::new_request(sentiric_sip_core::Method::Invite, to_uri.to_string());
@@ -162,10 +142,8 @@ impl CallHandler {
         invite.headers.push(Header::new(HeaderName::To, format!("<{}>", to_uri)));
         invite.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
         invite.headers.push(Header::new(HeaderName::CSeq, "1 INVITE".to_string()));
-        
         let contact_uri = format!("<sip:b2bua@{}:{}>", self.config.sbc_public_ip, 5060);
         invite.headers.push(Header::new(HeaderName::Contact, contact_uri));
-
         invite.headers.push(Header::new(HeaderName::ContentType, "application/sdp".to_string()));
         invite.headers.push(Header::new(HeaderName::ContentLength, sdp_body.len().to_string()));
         invite.body = sdp_body;
@@ -179,7 +157,6 @@ impl CallHandler {
             local_tag,
         };
         self.calls.insert(CallSession::new(session_data)).await;
-
         let proxy_addr: SocketAddr = self.config.proxy_sip_addr.parse()?;
         transport.send(&invite.to_bytes(), proxy_addr).await?;
         Ok(())
@@ -187,12 +164,9 @@ impl CallHandler {
 
     pub async fn process_bye(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        info!(event = "BYE_RECEIVED", sip.call_id = %call_id, "🛑 Çağrı sonlandırma isteği alındı");
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
-        
         if let Some(session) = self.calls.remove(&call_id).await {
             self.media_mgr.release_port(session.data.rtp_port, &call_id).await;
-            // [DÜZELTME]: publish_call_ended güncel imzaya uygun çağrıldı
             self.event_mgr.publish_call_ended(&call_id, "normal_clearing").await;
             info!(event = "CALL_TERMINATED", sip.call_id = %call_id, "✅ Çağrı temizlendi");
         }
@@ -200,21 +174,15 @@ impl CallHandler {
 
     pub async fn process_cancel(&self, transport: Arc<sentiric_sip_core::SipTransport>, req: SipPacket, src_addr: SocketAddr) {
         let call_id = req.get_header_value(HeaderName::CallId).cloned().unwrap_or_default();
-        info!(event = "CANCEL_RECEIVED", sip.call_id = %call_id, "🛑 Arama iptal edildi (CANCEL)");
-        
         let _ = transport.send(&SipResponseFactory::create_200_ok(&req).to_bytes(), src_addr).await;
-        
         if let Some(session) = self.calls.remove(&call_id).await {
             self.media_mgr.release_port(session.data.rtp_port, &call_id).await;
-            // [DÜZELTME]: publish_call_ended güncel imzaya uygun çağrıldı
             self.event_mgr.publish_call_ended(&call_id, "cancelled").await;
-            info!(event = "CALL_TERMINATED_BY_CANCEL", sip.call_id = %call_id, "✅ Çağrı CANCEL ile temizlendi");
         }
     }
 
     pub async fn process_ack(&self, call_id: &str) {
         self.calls.update_state(call_id, CallState::Established).await;
         self.event_mgr.publish_call_answered(call_id).await;
-        info!(event = "SIP_ACK_RECEIVED", sip.call_id = %call_id, "ACK alındı, diyalog tamamen kuruldu (Answer Time Kaydedildi)");
     }
 }
