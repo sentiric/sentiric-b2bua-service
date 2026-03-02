@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr; 
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, warn};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -79,10 +79,7 @@ impl CallHandler {
                 );
 
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
-                    Ok(p) => {
-                        info!(event = "MEDIA_PORT_ALLOCATED", sip.call_id = %call_id, rtp.port = p, "🎤 RTP Portu tahsis edildi");
-                        p
-                    },
+                    Ok(p) => p,
                     Err(e) => {
                         error!(event="MEDIA_ALLOC_FAIL", sip.call_id=%call_id, error=%e, "Media failure");
                         let _ = transport.send(&SipResponseFactory::create_error(&req, 503, "Media Error").to_bytes(), src_addr).await;
@@ -91,14 +88,7 @@ impl CallHandler {
                 };
 
                 let sbc_rtp_target = self.extract_rtp_target_from_sdp(&req.body)
-                    .unwrap_or_else(|| {
-                        warn!(event="SDP_PARSE_FAIL", sip.call_id=%call_id, "SDP parsing failed. Using source IP fallback.");
-                        format!("{}:{}", src_addr.ip(), 30000) 
-                    });
-
-                // [LOBOTOMİ YAPILDI]: Echo Test ve StartRecording kodları tamamen silindi.
-                // B2BUA artık komut vermez, sadece sinyal hattını kurar.
-                // Komutları Workflow Service verecek.
+                    .unwrap_or_else(|| format!("{}:{}", src_addr.ip(), 30000));
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
@@ -135,15 +125,23 @@ impl CallHandler {
 
                 self.calls.insert(session).await;
 
-                let packet_bytes = ok_resp.to_bytes();
-                let raw_str = String::from_utf8_lossy(&packet_bytes);
-                debug!(event = "SIP_RAW_DUMP", sip.call_id = %call_id, payload = %raw_str, "🚨 DEBUG: B2BUA'dan çıkan 200 OK paketi");
-
-                //[MİMARİ ZİRVESİ]: 200 OK gönderilir gönderilmez Olay Fırlatılır.
-                // Workflow bu olayı beklemektedir.
-                if transport.send(&packet_bytes, src_addr).await.is_ok() {
-                    self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
+                if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
+                    self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution.clone())).await;
                     info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, "✅ Çağrı kuruldu (200 OK) ve Olay fırlatıldı.");
+                    
+                    // [DÜZELTME]: Prost naming convention: ACTION_TYPE_ECHO_TEST -> EchoTest
+                    match action_type {
+                        ActionType::EchoTest => {
+                            info!(event = "NATIVE_ACTION_ECHO", sip.call_id = %call_id, "🔊 B2BUA, native Echo Test'i başlatıyor.");
+                            if let Err(e) = self.media_mgr.enable_echo_test(rtp_port, &sbc_rtp_target).await {
+                                error!(event = "ECHO_START_FAIL", error = %e, "Echo testi başlatılamadı.");
+                            }
+                        }
+                        ActionType::BridgeCall => {
+                            warn!(event = "NATIVE_ACTION_BRIDGE_TODO", sip.call_id = %call_id, "🌉 Native BridgeCall henüz implemente edilmedi.");
+                        }
+                        _ => {}
+                    }
                 }
             },
             Err(e) => {
@@ -194,7 +192,8 @@ impl CallHandler {
         
         if let Some(session) = self.calls.remove(&call_id).await {
             self.media_mgr.release_port(session.data.rtp_port, &call_id).await;
-            self.event_mgr.publish_call_ended(&call_id).await;
+            // [DÜZELTME]: publish_call_ended güncel imzaya uygun çağrıldı
+            self.event_mgr.publish_call_ended(&call_id, "normal_clearing").await;
             info!(event = "CALL_TERMINATED", sip.call_id = %call_id, "✅ Çağrı temizlendi");
         }
     }
@@ -207,7 +206,8 @@ impl CallHandler {
         
         if let Some(session) = self.calls.remove(&call_id).await {
             self.media_mgr.release_port(session.data.rtp_port, &call_id).await;
-            self.event_mgr.publish_call_ended(&call_id).await;
+            // [DÜZELTME]: publish_call_ended güncel imzaya uygun çağrıldı
+            self.event_mgr.publish_call_ended(&call_id, "cancelled").await;
             info!(event = "CALL_TERMINATED_BY_CANCEL", sip.call_id = %call_id, "✅ Çağrı CANCEL ile temizlendi");
         }
     }
