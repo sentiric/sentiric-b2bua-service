@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-b2bua-service"
-version = "1.5.8"
+version = "1.5.9"
 edition = "2021"
 
 [dependencies]
@@ -28,8 +28,6 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 dashmap = "5.5"
 lapin = "2.3.1"
-
-#[KRİTİK DÜZELTME]: connection-manager özelliği eklendi
 redis = { version = "0.26", features = ["tokio-rustls-comp", "connection-manager"] }
 
 # --- THE IRON CORE ---

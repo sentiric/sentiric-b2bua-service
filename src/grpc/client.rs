@@ -6,9 +6,8 @@ use sentiric_contracts::sentiric::media::v1::media_service_client::MediaServiceC
 use sentiric_contracts::sentiric::sip::v1::registrar_service_client::RegistrarServiceClient;
 use sentiric_contracts::sentiric::user::v1::user_service_client::UserServiceClient;
 use sentiric_contracts::sentiric::dialplan::v1::dialplan_service_client::DialplanServiceClient;
-use tonic::transport::{Channel, ClientTlsConfig, Certificate, Identity};
-use std::time::Duration;
-use tracing::{info, error, warn};
+use tonic::transport::{Channel, ClientTlsConfig, Certificate, Identity, Endpoint};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct InternalClients {
@@ -20,21 +19,29 @@ pub struct InternalClients {
 
 impl InternalClients {
     pub async fn connect(config: &AppConfig) -> Result<Self> {
-        info!("🔌 İç servislere bağlanılıyor (mTLS + Agresif KeepAlive)...");
+        info!("🔌 İç servislere bağlanılıyor (Lazy Connect + mTLS)...");
 
-        let media_channel = match create_secure_channel(&config.media_service_url, "media-service", config).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("❌ Media Service bağlantı hatası: {:#}", e);
-                return Err(e);
+        // TLS Yapılandırmasını Hazırla
+        let tls_config = if !config.ca_path.is_empty() {
+            match load_tls_config(config).await {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    warn!("⚠️ mTLS sertifikaları yüklenemedi, güvensiz mod denenecek: {}", e);
+                    None
+                }
             }
+        } else {
+            warn!("⚠️ mTLS CA yolu boş, güvensiz bağlantılar kullanılacak.");
+            None
         };
+        
+        // Endpoint'leri oluştur (Henüz bağlanmaz, ilk istekte bağlanır)
+        let media_channel = connect_endpoint(&config.media_service_url, &tls_config).await?;
+        let registrar_channel = connect_endpoint(&config.registrar_service_url, &tls_config).await?;
+        let user_channel = connect_endpoint(&config.user_service_url, &tls_config).await?;
+        let dialplan_channel = connect_endpoint(&config.dialplan_service_url, &tls_config).await?;
 
-        let registrar_channel = create_secure_channel(&config.registrar_service_url, "registrar-service", config).await?;
-        let user_channel = create_secure_channel(&config.user_service_url, "user-service", config).await?;
-        let dialplan_channel = create_secure_channel(&config.dialplan_service_url, "dialplan-service", config).await?;
-
-        info!("✅ Tüm gRPC istemcileri başarıyla oluşturuldu.");
+        info!("✅ Tüm gRPC istemci Endpoint'leri başarıyla yapılandırıldı.");
 
         Ok(Self {
             media: MediaServiceClient::new(media_channel),
@@ -45,51 +52,37 @@ impl InternalClients {
     }
 }
 
-async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig) -> Result<Channel> {
-    let target_url = if url.starts_with("http") {
-        if url.starts_with("http://") {
-             warn!("⚠️ Güvensiz URL tespit edildi ({}), HTTPS'e zorlanıyor.", url);
-             url.replace("http://", "https://")
+async fn connect_endpoint(url: &str, tls_config: &Option<ClientTlsConfig>) -> Result<Channel> {
+    // URL'i parse et
+    let uri = url.parse::<tonic::transport::Uri>()
+        .with_context(|| format!("Geçersiz URL: {}", url))?;
+    
+    let mut endpoint = Endpoint::from(uri);
+
+    // Eğer HTTPS ise TLS ayarlarını ekle
+    if url.starts_with("https") {
+        if let Some(tls) = tls_config {
+            endpoint = endpoint.tls_config(tls.clone())?;
         } else {
-            url.to_string()
+            warn!("HTTPS URL için TLS konfigürasyonu bulunamadı: {}", url);
         }
-    } else {
-        format!("https://{}", url)
-    };
+    }
 
-    let cert = tokio::fs::read(&config.cert_path).await
-        .with_context(|| format!("İstemci Sertifikası okunamadı: {}", config.cert_path))?;
-    
-    let key = tokio::fs::read(&config.key_path).await
-        .with_context(|| format!("İstemci Anahtarı okunamadı: {}", config.key_path))?;
-    
+    // [KRİTİK]: connect_lazy() kullanarak servisin ayakta olmasını beklemiyoruz.
+    // İlk istekte otomatik bağlanacak.
+    Ok(endpoint.connect_lazy())
+}
+
+async fn load_tls_config(config: &AppConfig) -> Result<ClientTlsConfig> {
+    let cert = tokio::fs::read(&config.cert_path).await.context("İstemci sertifikası okunamadı")?;
+    let key = tokio::fs::read(&config.key_path).await.context("İstemci anahtarı okunamadı")?;
     let identity = Identity::from_pem(cert, key);
-
-    let ca_cert = tokio::fs::read(&config.ca_path).await
-        .with_context(|| format!("CA Sertifikası okunamadı: {}", config.ca_path))?;
     
+    let ca_cert = tokio::fs::read(&config.ca_path).await.context("CA sertifikası okunamadı")?;
     let ca_certificate = Certificate::from_pem(ca_cert);
 
-    let tls_config = ClientTlsConfig::new()
-        .domain_name(server_name)
+    Ok(ClientTlsConfig::new()
+        .domain_name("sentiric.cloud") // Genel SNI
         .ca_certificate(ca_certificate)
-        .identity(identity);
-
-    info!("🔗 Bağlanılıyor: {} (SNI: {})", target_url, server_name);
-
-    // [MÜKEMMEL TELEKOM OPTİMİZASYONU]: gRPC HTTP/2 Keep-Alive ve Timeout Tuning
-    // Amaç: Soğuk başlangıç (Cold start) ve NAT/Firewall sessiz düşmelerini (Silent Drop) engellemek.
-    let channel = Channel::from_shared(target_url)?
-        .connect_timeout(Duration::from_secs(2)) // Bağlantı en fazla 2 saniye sürsün
-        .keep_alive_while_idle(true) // Trafik yokken bile HTTP/2 PING at!
-        .http2_keep_alive_interval(Duration::from_secs(10)) // 10 saniyede bir PING at (Firewall'u delik tut)
-        .keep_alive_timeout(Duration::from_secs(3)) // 3 saniyede PING cevabı gelmezse kopar ve yeniden bağlan
-        .tcp_nodelay(true) // Nagle algoritmasını kapat (Düşük gecikme)
-        .tcp_keepalive(Some(Duration::from_secs(10))) // OS seviyesinde de TCP Keep-Alive
-        .tls_config(tls_config)?
-        .connect()
-        .await
-        .with_context(|| format!("{} servisine gRPC bağlantısı kurulamadı", server_name))?;
-
-    Ok(channel)
+        .identity(identity))
 }

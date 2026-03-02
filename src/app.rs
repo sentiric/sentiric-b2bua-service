@@ -1,4 +1,4 @@
-// src/app.rs
+// sentiric-b2bua-service/src/app.rs
 use crate::config::AppConfig;
 use crate::grpc::service::MyB2BuaService;
 use crate::grpc::client::InternalClients;
@@ -22,7 +22,7 @@ use hyper::{
     Body, Request, Response, Server as HttpServer, StatusCode,
 };
 use sentiric_sip_core::SipTransport;
-use std::time::Duration;
+
 
 pub struct App {
     config: Arc<AppConfig>,
@@ -58,7 +58,6 @@ impl App {
             subscriber.with(fmt::layer().compact()).init();
         }
 
-        // [SUTS] System Boot Event
         info!(
             event = "SYSTEM_STARTUP",
             service_name = "sentiric-b2bua-service",
@@ -74,90 +73,42 @@ impl App {
         let (sip_shutdown_tx, sip_shutdown_rx) = mpsc::channel(1);
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
 
-        // -----------------------------------------------------------
         // 1. ERKEN PORT BAĞLAMA (EARLY BINDING)
-        // -----------------------------------------------------------
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
-        
         info!(event="SIP_BINDING_INIT", bind=%bind_addr, "UDP Portu erkenden bağlanıyor...");
-        
         let transport = Arc::new(SipTransport::new(&bind_addr).await
             .with_context(|| format!("UDP Portuna bağlanılamadı: {}", bind_addr))?);
-            
-        info!(event="SIP_BINDING_SUCCESS", "✅ UDP Portu dinlemeye alındı. Paketler tamponlanıyor.");
+        info!(event="SIP_BINDING_SUCCESS", "✅ UDP Portu dinlemeye alındı.");
 
-        // -----------------------------------------------------------
-        // 2. NETWORK WARMER (AĞ ISITICI)
-        // -----------------------------------------------------------
+        // 2. NETWORK WARMER
         let proxy_target = &self.config.proxy_sip_addr;
-        
         match tokio::net::lookup_host(proxy_target).await {
             Ok(mut addrs) => {
                 if let Some(proxy_addr) = addrs.next() {
                     let warmer_packet = [0u8; 4]; 
-                    let socket = transport.get_socket();
-                    match socket.send_to(&warmer_packet, proxy_addr).await {
-                        Ok(_) => info!(
-                            event="NETWORK_WARMER_SENT", 
-                            target=%proxy_addr, 
-                            "🌐 Ağ yolu ısıtma paketi başarıyla gönderildi."
-                        ),
-                        Err(e) => warn!(
-                            event="NETWORK_WARMER_FAIL", 
-                            error=%e, 
-                            "⚠️ Ağ ısıtma paketi gönderilemedi."
-                        ),
-                    }
-                } else {
-                    warn!(
-                        event="DNS_EMPTY", 
-                        host=%proxy_target, 
-                        "⚠️ DNS çözüldü ama IP adresi dönmedi."
-                    );
+                    let _ = transport.get_socket().send_to(&warmer_packet, proxy_addr).await;
+                    info!(event="NETWORK_WARMER_SENT", target=%proxy_addr, "🌐 Ağ yolu ısıtma paketi gönderildi.");
                 }
             },
-            Err(e) => {
-                warn!(
-                    event="DNS_FAIL", 
-                    host=%proxy_target, 
-                    error=%e, 
-                    "⚠️ Network Warmer: Proxy adresi çözümlenemedi."
-                );
-            }
+            Err(e) => warn!(event="DNS_FAIL", host=%proxy_target, error=%e, "⚠️ Network Warmer: Proxy adresi çözülemedi.")
         }
 
-        // 3. Clients (Retry Logic)
-        let clients = loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.recv() => {
-                    warn!(event="STARTUP_ABORT", "Başlangıç sırasında kapatma sinyali.");
-                    return Ok(());
-                },
-                res = InternalClients::connect(&self.config) => {
-                    match res {
-                        Ok(c) => {
-                            info!(event="CLIENTS_CONNECTED", "Bağımlı servisler hazır.");
-                            break Arc::new(Mutex::new(c));
-                        },
-                        Err(e) => {
-                            error!(event="CLIENT_CONNECT_FAIL", error=%e, "Bağlantı hatası, tekrar deneniyor...");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                    }
-                }
-            }
-        };
+        // 3. Clients (Lazy Connect - No Retry Loop Needed)
+        // [DÜZELTME]: Retry döngüsü kaldırıldı, connect_lazy kullanılıyor.
+        let clients = Arc::new(Mutex::new(
+            InternalClients::connect(&self.config)
+                .await
+                .context("gRPC istemcileri yapılandırılamadı")?,
+        ));
 
-        // 4. Redis (CallStore encapsulates ConnectionManager)
+        // 4. Redis
         info!(event="REDIS_CONNECT", url=%self.config.redis_url, "Redis başlatılıyor...");
-        let calls = loop {
-            match CallStore::new(&self.config.redis_url).await {
-                Ok(c) => break c,
-                Err(e) => {
-                    error!(event="REDIS_ERROR", error=%e, "Redis bağlantı hatası. Tekrar deneniyor...");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
+        // Auto-healing ConnectionManager call store içinde
+        let calls = match CallStore::new(&self.config.redis_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(event="REDIS_ERROR", error=%e, "Kritik: Redis bağlantısı başarısız.");
+                return Err(e);
             }
         };
 
@@ -203,9 +154,7 @@ impl App {
             res = grpc_server_handle => { if let Err(e) = res? { error!("gRPC Error: {}", e); } },
             _res = http_server_handle => {}, 
             _res = sip_handle => {}, 
-            _ = ctrl_c => { 
-                warn!(event="SIGINT_RECEIVED", "Kapatma sinyali (Ctrl+C) alındı."); 
-            },
+            _ = ctrl_c => { warn!(event="SIGINT_RECEIVED", "Kapatma sinyali (Ctrl+C) alındı."); },
         }
 
         let _ = shutdown_tx.send(()).await;
