@@ -1,4 +1,4 @@
-// sentiric-b2bua-service/src/app.rs
+// src/app.rs
 use crate::config::AppConfig;
 use crate::grpc::service::MyB2BuaService;
 use crate::grpc::client::InternalClients;
@@ -77,8 +77,6 @@ impl App {
         // -----------------------------------------------------------
         // 1. ERKEN PORT BAĞLAMA (EARLY BINDING)
         // -----------------------------------------------------------
-        // Tracing (Loglama) zaten bootstrap'te başladığı için burada info! kullanabiliriz.
-        // SutsFormatter bunu otomatik JSON'a çevirecek.
         let bind_addr = format!("{}:{}", self.config.sip_bind_ip, self.config.sip_port);
         
         info!(event="SIP_BINDING_INIT", bind=%bind_addr, "UDP Portu erkenden bağlanıyor...");
@@ -91,7 +89,6 @@ impl App {
         // -----------------------------------------------------------
         // 2. NETWORK WARMER (AĞ ISITICI)
         // -----------------------------------------------------------
-        // DNS Çözümleme ile IP'yi bul ve boş paket at.
         let proxy_target = &self.config.proxy_sip_addr;
         
         match tokio::net::lookup_host(proxy_target).await {
@@ -152,9 +149,17 @@ impl App {
             }
         };
 
-        // 4. Redis
+        // 4. Redis (CallStore encapsulates ConnectionManager)
         info!(event="REDIS_CONNECT", url=%self.config.redis_url, "Redis başlatılıyor...");
-        let calls = CallStore::new(&self.config.redis_url).await.context("Call Store hatası")?;
+        let calls = loop {
+            match CallStore::new(&self.config.redis_url).await {
+                Ok(c) => break c,
+                Err(e) => {
+                    error!(event="REDIS_ERROR", error=%e, "Redis bağlantı hatası. Tekrar deneniyor...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        };
 
         // 5. RabbitMQ
         info!(event="RABBITMQ_CONNECT", url=%self.config.rabbitmq_url, "RabbitMQ başlatılıyor...");
