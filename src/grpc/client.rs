@@ -20,7 +20,7 @@ pub struct InternalClients {
 
 impl InternalClients {
     pub async fn connect(config: &AppConfig) -> Result<Self> {
-        info!("🔌 İç servislere bağlanılıyor (mTLS + KeepAlive)...");
+        info!("🔌 İç servislere bağlanılıyor (mTLS + Agresif KeepAlive)...");
 
         let media_channel = match create_secure_channel(&config.media_service_url, "media-service", config).await {
             Ok(c) => c,
@@ -77,12 +77,15 @@ async fn create_secure_channel(url: &str, server_name: &str, config: &AppConfig)
 
     info!("🔗 Bağlanılıyor: {} (SNI: {})", target_url, server_name);
 
-    // [KRİTİK DÜZELTME]: HTTP/2 Keep-Alive eklendi.
+    // [MÜKEMMEL TELEKOM OPTİMİZASYONU]: gRPC HTTP/2 Keep-Alive ve Timeout Tuning
+    // Amaç: Soğuk başlangıç (Cold start) ve NAT/Firewall sessiz düşmelerini (Silent Drop) engellemek.
     let channel = Channel::from_shared(target_url)?
-        .connect_timeout(Duration::from_secs(5))
-        .keep_alive_while_idle(true)
-        .http2_keep_alive_interval(Duration::from_secs(15))
-        .keep_alive_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(2)) // Bağlantı en fazla 2 saniye sürsün
+        .keep_alive_while_idle(true) // Trafik yokken bile HTTP/2 PING at!
+        .http2_keep_alive_interval(Duration::from_secs(10)) // 10 saniyede bir PING at (Firewall'u delik tut)
+        .keep_alive_timeout(Duration::from_secs(3)) // 3 saniyede PING cevabı gelmezse kopar ve yeniden bağlan
+        .tcp_nodelay(true) // Nagle algoritmasını kapat (Düşük gecikme)
+        .tcp_keepalive(Some(Duration::from_secs(10))) // OS seviyesinde de TCP Keep-Alive
         .tls_config(tls_config)?
         .connect()
         .await
