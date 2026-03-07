@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr; 
-use tracing::{info, error}; // [DÜZELTME]: Kullanılmayan warn ve debug kaldırıldı
+use tracing::{info, error};
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -80,10 +80,13 @@ impl CallHandler {
                 let sbc_rtp_target = self.extract_rtp_target_from_sdp(&req.body)
                     .unwrap_or_else(|| format!("{}:{}", src_addr.ip(), 30000));
 
+                // [KRİTİK DÜZELTME]: Port ayrılır ayrılmaz Media Service'e hedefi bildir.
+                // Bu sayede Media Service anında 20ms'lik yasal sessizlik basmaya başlar, 
+                // SBC kilidi açılır (Latching) ve müşteri sesi 0. saniyede gelmeye başlar.
+                let _ = self.media_mgr.set_target(rtp_port, &sbc_rtp_target).await;
+
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
-                
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
-                
                 let mut ok_resp = SipResponseFactory::create_200_ok(&req);
                 
                 if let Some(to_h) = ok_resp.headers.iter_mut().find(|h| h.name == HeaderName::To) {
@@ -190,6 +193,9 @@ impl CallHandler {
             bye.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
             bye.headers.push(Header::new(HeaderName::CSeq, "999 BYE".to_string())); 
             
+            // [KRİTİK DÜZELTME]: BYE paketinin müşteriye ulaşması için Route başlığı ekle.
+            bye.headers.push(Header::new(HeaderName::Route, format!("<sip:sbc@{}:{};lr>", self.config.sbc_public_ip, 5060)));
+
             if let Ok(proxy_addr) = self.config.proxy_sip_addr.parse() {
                 let _ = transport.send(&bye.to_bytes(), proxy_addr).await;
             }

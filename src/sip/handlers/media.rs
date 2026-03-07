@@ -31,6 +31,18 @@ impl MediaManager {
         Ok(res.into_inner().rtp_port)
     }
 
+    // [YENİ]: Otonom Latching için Hedef Bildirimi
+    pub async fn set_target(&self, rtp_port: u32, rtp_target: &str) -> anyhow::Result<()> {
+        let mut media_client = { let guard = self.clients.lock().await; guard.media.clone() };
+        let req = tonic::Request::new(PlayAudioRequest {
+            audio_uri: "control://set_target".to_string(),
+            server_rtp_port: rtp_port,
+            rtp_target_addr: rtp_target.to_string(),
+        });
+        media_client.play_audio(req).await?;
+        Ok(())
+    }
+
     pub async fn release_port(&self, port: u32, call_id: &str) {
         let mut media_client = { let guard = self.clients.lock().await; guard.media.clone() };
         let mut req = Request::new(ReleasePortRequest { rtp_port: port });
@@ -40,18 +52,6 @@ impl MediaManager {
         tokio::spawn(async move { 
             let _ = media_client.release_port(req).await; 
         });
-    }
-
-    // [KRİTİK EKLEME]: Echo testini media-service üzerinden tetikleyen metod
-    pub async fn enable_echo_test(&self, rtp_port: u32, rtp_target: &str) -> anyhow::Result<()> {
-        let mut media_client = { let guard = self.clients.lock().await; guard.media.clone() };
-        let req = Request::new(PlayAudioRequest {
-            audio_uri: "control://enable_echo".to_string(),
-            server_rtp_port: rtp_port,
-            rtp_target_addr: rtp_target.to_string(),
-        });
-        media_client.play_audio(req).await?;
-        Ok(())
     }
 
     pub fn generate_sdp(&self, rtp_port: u32) -> Vec<u8> {
