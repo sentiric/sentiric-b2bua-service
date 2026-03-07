@@ -10,6 +10,7 @@ tonic = { version = "0.11", features = ["tls", "tls-roots"] }
 prost = "0.12"
 prost-types = "0.12"
 hyper = { version = "0.14", features = ["full"] }
+futures = "0.3" # [DÜZELTME]: StreamExt trait'i için eklendi
 
 # Observability
 tracing = "0.1"

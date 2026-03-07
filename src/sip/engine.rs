@@ -74,4 +74,8 @@ impl B2BuaEngine {
             }
         }
     }
+
+    pub async fn terminate_session(&self, call_id: &str) {
+        self.call_handler.terminate_session(self.transport.clone(), call_id).await;
+    }    
 }

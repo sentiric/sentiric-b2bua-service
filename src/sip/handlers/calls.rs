@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::str::FromStr; 
-use tracing::{info, error, warn, debug};
+use tracing::{info, error}; // [DÜZELTME]: Kullanılmayan warn ve debug kaldırıldı
 use sentiric_sip_core::{
     SipPacket, HeaderName, Header, SipUri,
     builder::SipResponseFactory,
@@ -53,7 +53,6 @@ impl CallHandler {
 
         let _ = transport.send(&SipResponseFactory::create_100_trying(&req).to_bytes(), src_addr).await;
 
-        // 1. Dialplan Sorgusu
         let dialplan_res = {
             let mut clients = self.clients.lock().await;
             let mut dp_req = Request::new(ResolveDialplanRequest {
@@ -69,7 +68,6 @@ impl CallHandler {
             Ok(response) => {
                 let resolution = response.into_inner();
                 
-                // 2. Media Port Tahsisi
                 let rtp_port = match self.media_mgr.allocate_port(&call_id).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -84,7 +82,6 @@ impl CallHandler {
 
                 let local_tag = sentiric_sip_core::utils::generate_tag("b2bua");
                 
-                // [FIX]: generate_sdp artık rtp_port'u KESİN olarak kullanıyor
                 let sdp_body = self.media_mgr.generate_sdp(rtp_port);
                 
                 let mut ok_resp = SipResponseFactory::create_200_ok(&req);
@@ -118,11 +115,9 @@ impl CallHandler {
                 session.active_transaction = Some(tx);
                 self.calls.insert(session).await;
 
-                // 3. SIP Yanıtı ve RabbitMQ Olayı
                 if transport.send(&ok_resp.to_bytes(), src_addr).await.is_ok() {
-                    // [ÖNEMLİ]: Olay fırlatılırken rtp_port bilgisi Workflow'a gidiyor.
                     self.event_mgr.publish_call_started(&call_id, rtp_port, &sbc_rtp_target, &from, &to, Some(resolution)).await;
-                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, rtp.port=rtp_port, "✅ Çağrı SIP seviyesinde kuruldu. Top artık Workflow'da.");
+                    info!(event="CALL_ESTABLISHED", sip.call_id=%call_id, rtp.port=rtp_port, "✅ Çağrı SIP seviyesinde kuruldu.");
                 }
             },
             Err(e) => {
@@ -184,5 +179,21 @@ impl CallHandler {
     pub async fn process_ack(&self, call_id: &str) {
         self.calls.update_state(call_id, CallState::Established).await;
         self.event_mgr.publish_call_answered(call_id).await;
+    }
+
+    pub async fn terminate_session(&self, transport: Arc<sentiric_sip_core::SipTransport>, call_id: &str) {
+        if let Some(session) = self.calls.remove(call_id).await {
+            self.media_mgr.release_port(session.data.rtp_port, call_id).await;
+            self.event_mgr.publish_call_ended(call_id, "system_terminated").await;
+            
+            let mut bye = SipPacket::new_request(sentiric_sip_core::Method::Bye, format!("<{}>", session.data.from_uri));
+            bye.headers.push(Header::new(HeaderName::CallId, call_id.to_string()));
+            bye.headers.push(Header::new(HeaderName::CSeq, "999 BYE".to_string())); 
+            
+            if let Ok(proxy_addr) = self.config.proxy_sip_addr.parse() {
+                let _ = transport.send(&bye.to_bytes(), proxy_addr).await;
+            }
+            info!(event = "CALL_FORCE_TERMINATED", sip.call_id = %call_id, "Sistem (Workflow/Agent) tarafından çağrı zorla sonlandırıldı.");
+        }
     }
 }

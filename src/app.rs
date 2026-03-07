@@ -122,8 +122,11 @@ impl App {
             clients, 
             calls, 
             transport.clone(), 
-            rabbitmq_client
+            rabbitmq_client.clone() // Clone ekledik
         ));
+
+        // [YENİ]: B2BUA Termination Consumer Başlat
+        rabbitmq_client.start_termination_consumer(engine.clone()).await;
 
         // 7. Servers
         let sip_server = SipServer::new(engine.clone(), transport);
